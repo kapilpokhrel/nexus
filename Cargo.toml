@@ -1,0 +1,12 @@
+[package]
+name = "conduit"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+httparse = "1.10.1"
+monoio = "0.2.4"
+
+[[bench]]
+name = "proxy_bench"
+harness = false
