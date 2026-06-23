@@ -9,10 +9,20 @@ use std::time::{Duration, Instant};
 const TOTAL_REQUESTS: u64 = 100000;
 const CONCURRENCY: u64 = 100;
 const PROXY_ADDR: &str = "127.0.0.1:5000";
+macro_rules! backend_addr {
+    () => { "127.0.0.1:8000" };
+}
+const REQUEST: &[u8] = concat!(
+    "GET / HTTP/1.1\r\n",
+    "Host: ",
+    backend_addr!(), "\r\n",
+    "Connection: close\r\n",
+    "Accept: */*\r\n\r\n"
+).as_bytes();
 
 fn start_server() {
     thread::spawn(|| {
-        let listener = TcpListener::bind("127.0.0.1:8000").unwrap();
+        let listener = TcpListener::bind(backend_addr!()).unwrap();
         let resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 34\r\nConnection: keep-alive\r\n\r\nHello from backend server on port 8000\n";
 
         for stream in listener.incoming() {
@@ -75,15 +85,13 @@ fn try_connect(addr: &str) {
 
 fn worker(count: u64, results: &mut Vec<f64>) -> u64 {
     let mut errors = 0u64;
-    let request =
-        b"GET / HTTP/1.1\r\nHost: localhost:5000\r\nConnection: close\r\nAccept: */*\r\n\r\n";
     let mut buf = [0u8; 4096];
 
     for _ in 0..count {
         let start = Instant::now();
         match TcpStream::connect(PROXY_ADDR) {
             Ok(mut stream) => {
-                if stream.write_all(request).is_err() {
+                if stream.write_all(REQUEST).is_err() {
                     errors += 1;
                     continue;
                 }
