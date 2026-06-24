@@ -12,13 +12,18 @@ const PROXY_ADDR: &str = "127.0.0.1:5000";
 macro_rules! backend_addr {
     () => { "127.0.0.1:8000" };
 }
+const BODY_SIZE: usize = 4096;
+
 const REQUEST: &[u8] = concat!(
     "GET / HTTP/1.1\r\n",
     "Host: ",
     backend_addr!(), "\r\n",
     "Connection: close\r\n",
-    "Accept: */*\r\n\r\n"
+    "Accept: */*\r\n",
+    "Content-Length: 4096\r\n\r\n",
 ).as_bytes();
+
+static REQUEST_BODY: [u8; BODY_SIZE] = [b'X'; BODY_SIZE];
 
 fn start_server() {
     thread::spawn(|| {
@@ -91,7 +96,9 @@ fn worker(count: u64, results: &mut Vec<f64>) -> u64 {
         let start = Instant::now();
         match TcpStream::connect(PROXY_ADDR) {
             Ok(mut stream) => {
-                if stream.write_all(REQUEST).is_err() {
+                if stream.write_all(REQUEST).is_err()
+                    || stream.write_all(&REQUEST_BODY).is_err()
+                {
                     errors += 1;
                     continue;
                 }
