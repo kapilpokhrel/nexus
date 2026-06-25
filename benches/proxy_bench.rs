@@ -8,16 +8,13 @@ use std::time::{Duration, Instant};
 
 const TOTAL_REQUESTS: u64 = 100000;
 const CONCURRENCY: u64 = 100;
-const PROXY_ADDR: &str = "127.0.0.1:6000";
-macro_rules! backend_addr {
-    () => { "127.0.0.1:8000" };
-}
+const PROXY_ADDR: &str = "127.0.0.1:5000";
+const BACKEND_ADDR: &str = "127.0.0.1:8000";
 const BODY_SIZE: usize = 8192;
 
 const REQUEST: &[u8] = concat!(
     "GET / HTTP/1.1\r\n",
-    "Host: ",
-    backend_addr!(), "\r\n",
+    "Host: example.com\r\n",
     "Connection: close\r\n",
     "Accept: */*\r\n",
     "Content-Length: 8192\r\n\r\n",
@@ -26,7 +23,7 @@ const REQUEST: &[u8] = concat!(
 static REQUEST_BODY: [u8; BODY_SIZE] = [b'X'; BODY_SIZE];
 
 fn start_server() {
-    let listener = Arc::new(TcpListener::bind(backend_addr!()).unwrap());
+    let listener = Arc::new(TcpListener::bind(BACKEND_ADDR).unwrap());
     static RESP: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 34\r\nConnection: keep-alive\r\n\r\nHello from backend server on port 8000\n";
 
     // 128 connection pools

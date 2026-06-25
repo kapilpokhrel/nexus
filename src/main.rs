@@ -1,75 +1,131 @@
+mod lua_config;
+
+use crate::lua_config::{Proxy, Request};
+use mlua::prelude::*;
 use monoio::buf::{IoBuf, IoBufMut};
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::{TcpListener, TcpStream};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::fs;
 use std::io;
 use std::mem::MaybeUninit;
 use std::ops::Range;
-mod lua_config;
+use std::rc::Rc;
 
-async fn host_backend<'a>(hdrs: &'_ [(&'a str, &'a str); 64]) -> io::Result<TcpStream> {
-    let host = hdrs
-        .iter()
-        .find(|h| h.0.eq_ignore_ascii_case("Host"))
-        .map(|h| h.1.trim())
-        .ok_or(io::Error::new(io::ErrorKind::InvalidData, "host not found"))?;
 
-    TcpStream::connect(host).await
+struct HttpHead {
+    content_len: Option<usize>,
+    chunked: bool,
+    header_count: usize,
+    header_offset: usize,
+}
+
+struct RequestInfo {
+    host: Option<Range<usize>>,
+    method: Option<Range<usize>>,
+    path: Option<Range<usize>>,
+}
+
+async fn find_host_backend<'a>(
+    host: &'a str,
+    req: Request<'a>,
+    lua: Lua,
+    handlers: Rc<RefCell<HashMap<Box<str>, LuaFunction>>>,
+) -> io::Result<TcpStream> {
+    let backend = lua
+        .scope(|scope| {
+            let req = scope.create_userdata(req)?;
+            Ok(handlers
+                .borrow()
+                .get(host)
+                .unwrap()
+                .call_async::<String>(req))
+        })
+        .unwrap()
+        .await
+        .unwrap(); // fuck this is ugly
+    TcpStream::connect(backend).await
 }
 
 #[allow(unused_variables)]
 #[monoio::main(threads = 8)]
 async fn main() {
-    let listener = TcpListener::bind("127.0.0.1:5000").unwrap();
+    let conf_source = fs::read("config.lua").unwrap();
+    // lua setup
+    let lua = Lua::new();
+    let handlers: Rc<RefCell<HashMap<Box<str>, LuaFunction>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+    let proxy = Proxy {
+        route_handlers: handlers.clone(),
+        listen_addr: "".into(),
+    };
+    let lua = Lua::new();
+
+    let proxy_ud = lua.create_userdata(proxy).unwrap();
+    lua.globals().set("proxy", proxy_ud).unwrap();
+
+    let source = lua.load(str::from_utf8(&conf_source).unwrap());
+    source.exec().unwrap();
+
+    let host: String = lua.globals().get::<LuaAnyUserData>("proxy").unwrap().borrow::<Proxy>().unwrap().listen_addr.as_ref().into();
+    println!("{}", host);
+    let listener = TcpListener::bind(host).unwrap();
+
     loop {
         let Ok((stream, _)) = listener.accept().await else {
             continue;
         };
+        let lua_pass = lua.clone();
+        let handlers_pass = handlers.clone();
         monoio::spawn(async move {
-            let _ = forward_http(stream).await;
+            let _ = forward_http(stream, lua_pass, handlers_pass).await;
         });
     }
 }
 
-async fn forward_http(mut client: TcpStream) -> io::Result<()> {
+async fn forward_http(
+    mut client: TcpStream,
+    lua: Lua,
+    handlers: Rc<RefCell<HashMap<Box<str>, LuaFunction>>>,
+) -> io::Result<()> {
     let buf = vec![0u8; 8 * 1024];
     let mut hdr_buf: [MaybeUninit<(Range<usize>, Range<usize>)>; 64] =
         [const { MaybeUninit::uninit() }; 64];
 
     // request
-    let (buf, hdr_end, read_len, cl, chunked, h_count) =
-        read_headers(buf, &mut client, &mut hdr_buf[..]).await?;
-    let hdr = get_hdrs(&buf, &hdr_buf, h_count);
-    let mut backend = host_backend(&hdr).await?;
+    let (buf, head, req_line, read_len) = read_headers(buf, &mut client, &mut hdr_buf[..]).await?;
 
-    let in_buf = read_len.saturating_sub(hdr_end);
-    let buf = if let Some(n) = cl {
-        let buf = fwd(buf, &mut backend, hdr_end + in_buf.min(n)).await?;
+    let (host, req) = get_host_requset(&buf, &hdr_buf, &head, &req_line);
+    let mut backend = find_host_backend(host, req, lua, handlers).await?;
+
+    let in_buf = read_len.saturating_sub(head.header_offset);
+    let buf = if let Some(n) = head.content_len {
+        let buf = fwd(buf, &mut backend, head.header_offset + in_buf.min(n)).await?;
         send_n(buf, &mut client, &mut backend, n.saturating_sub(in_buf)).await?
-    } else if chunked {
-        // will probably have to use httparse::parse_chunk
+    } else if head.chunked {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "we don't handle chunked yet",
         ));
     } else {
-        fwd(buf, &mut backend, hdr_end).await?
+        fwd(buf, &mut backend, head.header_offset).await?
     };
 
     // response
-    let (buf, hdr_end, read_len, cl, chunked, _h_count) =
-        read_headers(buf, &mut backend, &mut hdr_buf).await?;
+    let (buf, head, _req_line, read_len) = read_headers(buf, &mut backend, &mut hdr_buf).await?;
 
-    let in_buf = read_len.saturating_sub(hdr_end);
-    if let Some(n) = cl {
-        let buf = fwd(buf, &mut client, hdr_end + in_buf.min(n)).await?;
+    let in_buf = read_len.saturating_sub(head.header_offset);
+    if let Some(n) = head.content_len {
+        let buf = fwd(buf, &mut client, head.header_offset + in_buf.min(n)).await?;
         let _ = send_n(buf, &mut backend, &mut client, n.saturating_sub(in_buf)).await?;
-    } else if chunked {
+    } else if head.chunked {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "we don't handle chunked yet",
         ));
     } else {
-        let _ = fwd(buf, &mut client, hdr_end).await?;
+        let _ = fwd(buf, &mut client, head.header_offset).await?;
     }
     Ok(())
 }
@@ -79,27 +135,42 @@ fn range_of(buf: &[u8], sub: &[u8]) -> Range<usize> {
     start..start + sub.len()
 }
 
-fn get_hdrs<'a>(
+fn get_host_requset<'a>(
     buf: &'a [u8],
     hdr: &[MaybeUninit<(Range<usize>, Range<usize>)>; 64],
-    n: usize,
-) -> [(&'a str, &'a str); 64] {
-    let mut out = [("", ""); 64];
-    for i in 0..n.min(64) {
+    head: &HttpHead,
+    req_line: &RequestInfo,
+) -> (&'a str, Request<'a>) {
+    let mut hdrs = [("", ""); 64];
+    for i in 0..head.header_count.min(64) {
         let (nr, vr) = unsafe { hdr[i].assume_init_read() };
-        out[i] = (unsafe { std::str::from_utf8_unchecked(&buf[nr]) }, unsafe {
+        hdrs[i] = (unsafe { std::str::from_utf8_unchecked(&buf[nr]) }, unsafe {
             std::str::from_utf8_unchecked(&buf[vr])
         });
     }
-    out
+    let host =
+        unsafe { std::str::from_utf8_unchecked(&buf[req_line.host.as_ref().unwrap().clone()]) };
+    let method =
+        unsafe { std::str::from_utf8_unchecked(&buf[req_line.method.as_ref().unwrap().clone()]) };
+    let path =
+        unsafe { std::str::from_utf8_unchecked(&buf[req_line.path.as_ref().unwrap().clone()]) };
+    (
+        host,
+        Request {
+            ip: "10.100.1.1".into(),
+            path,
+            method,
+            headers: hdrs,
+            headers_count: head.header_count,
+        },
+    )
 }
 
-/// returns (buf, header_end, total_bytes_read, content_length?, chunked?, header_count)
 async fn read_headers(
     mut buf: Vec<u8>,
     stream: &mut TcpStream,
     hdr_ranges: &mut [MaybeUninit<(Range<usize>, Range<usize>)>],
-) -> io::Result<(Vec<u8>, usize, usize, Option<usize>, bool, usize)> {
+) -> io::Result<(Vec<u8>, HttpHead, RequestInfo, usize)> {
     let mut ptr = 0;
     loop {
         let (res, slice) = stream.read(buf.slice_mut(ptr..)).await;
@@ -116,7 +187,7 @@ async fn read_headers(
             }
             continue;
         };
-        let se = se + 2;
+        let se = se + 2; // past the \r\n — start of headers
 
         let mut raw = [httparse::EMPTY_HEADER; 64];
         match httparse::parse_headers(&buf[se..ptr], &mut raw) {
@@ -138,8 +209,40 @@ async fn read_headers(
                             .split(|&b| b == b',')
                             .any(|v| v.trim_ascii().eq_ignore_ascii_case(b"chunked"))
                 });
-                let n = parsed.len();
-                return Ok((buf, header_end, ptr, cl, chunked, n));
+                let host = parsed
+                    .iter()
+                    .find(|h| h.name.eq_ignore_ascii_case("Host"))
+                    .map(|h| range_of(&buf, h.value));
+                let h_count = parsed.len();
+
+                let (method, path) = {
+                    let req = &buf[..se - 2];
+                    let sp1 = req.iter().position(|&b| b == b' ');
+                    let sp2 = sp1.and_then(|i| {
+                        req[i + 1..]
+                            .iter()
+                            .position(|&b| b == b' ')
+                            .map(|j| i + 1 + j)
+                    });
+                    match (sp1, sp2) {
+                        (Some(e), Some(s)) if !req[..e].contains(&b'/') => {
+                            (Some(0..e), Some(e + 1..s))
+                        }
+                        _ => (None, None),
+                    }
+                };
+
+                return Ok((
+                    buf,
+                    HttpHead {
+                        content_len: cl,
+                        chunked,
+                        header_count: h_count,
+                        header_offset: header_end,
+                    },
+                    RequestInfo { host, method, path },
+                    ptr,
+                ));
             }
             Ok(httparse::Status::Partial) => {
                 if (se..ptr.saturating_sub(3))
