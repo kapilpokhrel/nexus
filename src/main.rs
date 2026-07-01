@@ -6,7 +6,7 @@ use monoio::buf::{IoBuf, IoBufMut};
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::{TcpListener, TcpStream};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io;
 use std::mem::MaybeUninit;
@@ -27,12 +27,41 @@ struct RequestInfo {
     path: Option<Range<usize>>,
 }
 
-async fn find_host_backend<'a>(
+const MAX_IDLE: usize = 8;
+
+thread_local! {
+    static CONN_POOL: RefCell<HashMap<String, VecDeque<TcpStream>>> = RefCell::new(HashMap::new());
+}
+
+async fn get_conn(backend_addr: &String) -> io::Result<TcpStream> {
+    let s = CONN_POOL.with(|p| {
+        p.borrow_mut().get_mut(backend_addr).and_then(|v| v.pop_back())
+    });
+    let stream = match s {
+        Some(stream) => {
+           stream
+        }
+        None => TcpStream::connect(backend_addr).await?
+    };
+    let _ = stream.set_nodelay(true);
+    Ok(stream)
+}
+
+async fn put_conn(backend_addr: String, s: TcpStream) {
+    CONN_POOL.with_borrow_mut(|h| {
+        let vq = h.entry(backend_addr).or_insert(VecDeque::new());
+        if vq.len() < MAX_IDLE {
+            vq.push_back(s)
+        }
+    });
+}
+
+async fn resolve_backend<'a>(
     host: &'a str,
     req: Request<'a>,
     lua: Lua,
     handlers: Rc<RefCell<HashMap<Box<str>, LuaFunction>>>,
-) -> io::Result<TcpStream> {
+) -> io::Result<String> {
     let backend = lua
         .scope(|scope| {
             let req = scope.create_userdata(req)?;
@@ -45,7 +74,7 @@ async fn find_host_backend<'a>(
         .unwrap()
         .await
         .unwrap(); // fuck this is ugly
-    TcpStream::connect(backend).await
+    Ok(backend)
 }
 
 #[allow(unused_variables)]
@@ -97,11 +126,12 @@ async fn forward_http(
     let (buf, head, req_line, read_len) = read_headers(buf, &mut client, &mut hdr_buf[..]).await?;
 
     let (host, req) = get_host_requset(&buf, &hdr_buf, &head, &req_line);
-    let mut backend = find_host_backend(host, req, lua, handlers).await?;
+    let backend_addr = resolve_backend(host, req, lua, handlers).await?;
+    let mut backend = get_conn(&backend_addr).await?;
 
     let in_buf = read_len.saturating_sub(head.header_offset);
     let buf = if let Some(n) = head.content_len {
-        let buf = fwd(buf, &mut backend, head.header_offset + in_buf.min(n)).await?;
+        let buf = fwd_or_reconnect(buf, &mut backend, head.header_offset + in_buf.min(n)).await?;
         send_n(buf, &mut client, &mut backend, n.saturating_sub(in_buf)).await?
     } else if head.chunked {
         return Err(io::Error::new(
@@ -109,7 +139,7 @@ async fn forward_http(
             "we don't handle chunked yet",
         ));
     } else {
-        fwd(buf, &mut backend, head.header_offset).await?
+        fwd_or_reconnect(buf, &mut backend, head.header_offset).await?
     };
 
     // response
@@ -127,6 +157,8 @@ async fn forward_http(
     } else {
         let _ = fwd(buf, &mut client, head.header_offset).await?;
     }
+
+    put_conn(backend_addr, backend).await;
     Ok(())
 }
 
@@ -264,6 +296,24 @@ async fn read_headers(
     }
 }
 
+async fn fwd_or_reconnect(mut buf: Vec<u8>, dst: &mut TcpStream, n: usize) -> io::Result<Vec<u8>> {
+    let (res, view) = dst.write_all(buf.slice(..n)).await;
+    buf = view.into_inner();
+    match res {
+        Ok(_) => Ok(buf),
+        Err(_) => {
+            let addr = dst.local_addr()?;
+            let new_dst = TcpStream::connect(addr).await?;
+            let _old = std::mem::replace(dst, new_dst);
+            let (res, view) = dst.write_all(buf.slice(..n)).await;
+            res?;
+            Ok(view.into_inner())
+        }
+    }
+}
+
+// i think there is a problem here
+// we will lose our buffer on error
 async fn fwd(buf: Vec<u8>, dst: &mut TcpStream, n: usize) -> io::Result<Vec<u8>> {
     let (res, view) = dst.write_all(buf.slice(..n)).await;
     res?;

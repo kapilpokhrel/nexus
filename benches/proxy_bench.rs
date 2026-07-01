@@ -15,7 +15,7 @@ const BODY_SIZE: usize = 8192;
 const REQUEST: &[u8] = concat!(
     "GET / HTTP/1.1\r\n",
     "Host: example.com\r\n",
-    "Connection: close\r\n",
+    //"Connection: close\r\n",
     "Accept: */*\r\n",
     "Content-Length: 8192\r\n\r\n",
 ).as_bytes();
