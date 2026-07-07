@@ -5,6 +5,7 @@ use mlua::prelude::*;
 use monoio::buf::{IoBuf, IoBufMut};
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::{TcpListener, TcpStream};
+use monoio::time::{timeout, Duration};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
@@ -62,7 +63,9 @@ async fn resolve_backend<'a>(
     lua: Lua,
     handlers: Rc<RefCell<HashMap<Box<str>, LuaFunction>>>,
 ) -> io::Result<String> {
-    let backend = lua
+    let backend = timeout(
+        Duration::from_millis(250),
+        lua
         .scope(|scope| {
             let req = scope.create_userdata(req)?;
             Ok(handlers
@@ -72,8 +75,10 @@ async fn resolve_backend<'a>(
                 .call_async::<String>(req))
         })
         .unwrap()
-        .await
-        .unwrap(); // fuck this is ugly
+    )
+    .await
+    .unwrap() // fuck this is ugly
+    .unwrap();
     Ok(backend)
 }
 
