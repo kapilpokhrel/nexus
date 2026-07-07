@@ -5,7 +5,6 @@ use mlua::prelude::*;
 use monoio::buf::{IoBuf, IoBufMut};
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::{TcpListener, TcpStream};
-use monoio::time::{timeout, Duration};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
@@ -63,22 +62,32 @@ async fn resolve_backend<'a>(
     lua: Lua,
     handlers: Rc<RefCell<HashMap<Box<str>, LuaFunction>>>,
 ) -> io::Result<String> {
-    let backend = timeout(
-        Duration::from_millis(250),
-        lua
-        .scope(|scope| {
-            let req = scope.create_userdata(req)?;
-            Ok(handlers
-                .borrow()
-                .get(host)
-                .unwrap()
-                .call_async::<String>(req))
-        })
-        .unwrap()
-    )
-    .await
-    .unwrap() // fuck this is ugly
-    .unwrap();
+    lua.set_hook(
+        LuaHookTriggers {
+            every_line: false,
+            on_calls: false,
+            on_returns: false,
+            // Check every 1000 VM instructions
+            every_nth_instruction: Some(1000),
+        },
+        move |_, _| {
+            // error after 1000 VM instructions
+            Err(mlua::Error::RuntimeError("timeout exceeded".to_string()))
+            // or we can check elapsed time and if not timeout, `Ok(LuaVmState::Continue)`
+        },
+    ).unwrap();
+
+
+    let backend = lua.scope(|scope| {
+        let req = scope.create_userdata(req)?;
+        handlers
+            .borrow()
+            .get(host)
+            .unwrap()
+            .call::<String>(req)
+    }).unwrap();
+
+    lua.remove_hook();
     Ok(backend)
 }
 
