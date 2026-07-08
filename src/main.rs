@@ -27,7 +27,7 @@ struct RequestInfo {
     path: Option<Range<usize>>,
 }
 
-const MAX_IDLE: usize = 8;
+const MAX_IDLE: usize = 15;
 
 thread_local! {
     static CONN_POOL: RefCell<HashMap<String, VecDeque<TcpStream>>> = RefCell::new(HashMap::new());
@@ -61,7 +61,11 @@ async fn resolve_backend<'a>(
     req: Request<'a>,
     lua: Lua,
     handlers: Rc<RefCell<HashMap<Box<str>, LuaFunction>>>,
+    static_routes_map: Rc<RefCell<HashMap<Box<str>, Box<str>>>>,
 ) -> io::Result<String> {
+    if let Some(addr) = static_routes_map.borrow().get(host) {
+        return Ok(addr.to_string());
+    }
     lua.set_hook(
         LuaHookTriggers {
             every_line: false,
@@ -99,8 +103,11 @@ async fn main() {
     let lua = Lua::new();
     let handlers: Rc<RefCell<HashMap<Box<str>, LuaFunction>>> =
         Rc::new(RefCell::new(HashMap::new()));
+    let static_route_map: Rc<RefCell<HashMap<Box<str>, Box<str>>>> =
+        Rc::new(RefCell::new(HashMap::new()));
     let proxy = Proxy {
         route_handlers: handlers.clone(),
+        static_route_map: static_route_map.clone(),
         listen_addr: "".into(),
     };
     let lua = Lua::new();
@@ -121,8 +128,9 @@ async fn main() {
         };
         let lua_pass = lua.clone();
         let handlers_pass = handlers.clone();
+        let routes_map_pass = static_route_map.clone();
         monoio::spawn(async move {
-            let _ = forward_http(stream, lua_pass, handlers_pass).await;
+            let _ = forward_http(stream, lua_pass, handlers_pass, routes_map_pass).await;
         });
     }
 }
@@ -131,6 +139,7 @@ async fn forward_http(
     mut client: TcpStream,
     lua: Lua,
     handlers: Rc<RefCell<HashMap<Box<str>, LuaFunction>>>,
+    static_routes_map: Rc<RefCell<HashMap<Box<str>, Box<str>>>>,
 ) -> io::Result<()> {
     let buf = vec![0u8; 8 * 1024];
     let mut hdr_buf: [MaybeUninit<(Range<usize>, Range<usize>)>; 64] =
@@ -140,7 +149,7 @@ async fn forward_http(
     let (buf, head, req_line, read_len) = read_headers(buf, &mut client, &mut hdr_buf[..]).await?;
 
     let (host, req) = get_host_requset(&buf, &hdr_buf, &head, &req_line);
-    let backend_addr = resolve_backend(host, req, lua, handlers).await?;
+    let backend_addr = resolve_backend(host, req, lua, handlers, static_routes_map).await?;
     let mut backend = get_conn(&backend_addr).await?;
 
     let in_buf = read_len.saturating_sub(head.header_offset);

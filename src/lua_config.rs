@@ -30,6 +30,7 @@ impl<'buf> LuaUserData for Request<'buf> {
 
 pub struct Proxy {
     pub route_handlers: Rc<RefCell<HashMap<Box<str>, LuaFunction>>>,
+    pub static_route_map: Rc<RefCell<HashMap<Box<str>, Box<str>>>>,
     pub listen_addr: Box<str>
 }
 
@@ -39,6 +40,12 @@ impl LuaUserData for Proxy {
             this.route_handlers.borrow_mut().insert(host, f);
             Ok(())
         });
+
+        methods.add_method_mut("on_route_static", |_, this, (host, f): (Box<str>, Box<str>)| {
+            this.static_route_map.borrow_mut().insert(host, f);
+            Ok(())
+        });
+        // hybrid of these two, we can use on_route_cached that takes a function and cache period but will heavily cache it so that it behaves like static
 
         methods.add_method_mut("listen_on", |_, this, addr: Box<str>| {
             this.listen_addr = addr;
@@ -69,8 +76,10 @@ mod tests {
         };
 
         let handlers: Rc<RefCell<HashMap<Box<str>, LuaFunction>>> = Rc::new(RefCell::new(HashMap::new()));
+        let static_route_map: Rc<RefCell<HashMap<Box<str>, Box<str>>>> = Rc::new(RefCell::new(HashMap::new()));
         let proxy = Proxy{
             route_handlers: handlers.clone(),
+            static_route_map,
             listen_addr: "".into(),
         };
         let lua = Lua::new();
