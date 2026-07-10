@@ -16,7 +16,6 @@ impl<'buf> LuaUserData for Request<'buf> {
         fields.add_field_method_get("ip", |lua, this| lua.create_string(this.ip.as_str()));
         fields.add_field_method_get("method", |lua, this| lua.create_string(this.method));
         fields.add_field_method_get("path", |lua, this| lua.create_string(this.path));
-        fields.add_field_method_get("path", |lua, this| lua.create_string(this.path));
         fields.add_field_method_get("headers", |lua, this| {
             let table = lua.create_table()?;
             for i in 0..this.headers_count {

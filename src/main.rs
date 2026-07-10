@@ -83,6 +83,7 @@ async fn resolve_backend<'a>(
 
 
     let backend = lua.scope(|scope| {
+        // benchmark shows that adding creating lua userdata takes significant time...
         let req = scope.create_userdata(req)?;
         handlers
             .borrow()
