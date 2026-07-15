@@ -12,15 +12,19 @@ use std::io;
 use std::mem::MaybeUninit;
 use std::ops::Range;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 
+#[derive(Debug)]
 struct HttpHead {
     content_len: Option<usize>,
     chunked: bool,
+    start_of_header: usize,
     header_count: usize,
     header_offset: usize,
 }
 
+#[derive(Debug)]
 struct RequestInfo {
     host: Option<Range<usize>>,
     method: Option<Range<usize>>,
@@ -31,6 +35,7 @@ const MAX_IDLE: usize = 15;
 
 thread_local! {
     static CONN_POOL: RefCell<HashMap<String, VecDeque<TcpStream>>> = RefCell::new(HashMap::new());
+    static LUA_FN_CACHE: RefCell<HashMap<String, (OnRequestResp, Instant)>> = RefCell::new(HashMap::new());
 }
 
 async fn get_conn(backend_addr: &String) -> io::Result<TcpStream> {
@@ -62,41 +67,57 @@ async fn resolve_backend<'a>(
     req: Request<'a>,
     context: Context,
     lua: Lua,
-    handlers: Rc<RefCell<HashMap<Box<str>, LuaFunction>>>,
+    handlers: Rc<RefCell<HashMap<Box<str>, (LuaFunction, Option<Duration>)>>>,
 ) -> io::Result<String> {
-    lua.set_hook(
-        LuaHookTriggers {
-            every_line: false,
-            on_calls: false,
-            on_returns: false,
-            // Check every 1000 VM instructions
-            every_nth_instruction: Some(1000),
-        },
-        move |_, _| {
-            // error after 1000 VM instructions
-            Err(mlua::Error::RuntimeError("timeout exceeded".to_string()))
-            // or we can check elapsed time and if not timeout, `Ok(LuaVmState::Continue)`
-        },
-    ).unwrap();
+    let handler_fn = handlers.borrow();
+    let (lua_fn, cache_ttl) = handler_fn.get(host).unwrap();
 
+    let call_lua_fn = || {
+        lua.set_hook(
+            LuaHookTriggers {
+                every_line: false,
+                on_calls: false,
+                on_returns: false,
+                // Check every 1000 VM instructions
+                every_nth_instruction: Some(1000),
+            },
+            move |_, _| {
+                // error after 1000 VM instructions
+                Err(mlua::Error::RuntimeError("timeout exceeded".to_string()))
+                // or we can check elapsed time and if not timeout, `Ok(LuaVmState::Continue)`
+            },
+        ).unwrap();
 
-    let backend = lua.scope(|scope| {
-        // benchmark shows that adding creating lua userdata takes significant time...
-        let req = scope.create_userdata(req)?;
-        let client = scope.create_userdata(client)?;
-        let context = scope.create_userdata(context)?;
-        handlers
-            .borrow()
-            .get(host)
-            .unwrap()
-            .call::<OnRequestResp>((client, req, context))
-    }).unwrap();
+        let resp = lua.scope(|scope| {
+            // benchmark shows that adding creating lua userdata takes significant time...
+            let req = scope.create_userdata(req)?;
+            let client = scope.create_userdata(client)?;
+            let context = scope.create_userdata(context)?;
+            lua_fn
+                .call::<OnRequestResp>((client, req, context))
+        }).unwrap();
+        lua.remove_hook();
+        resp
+    };
 
-    lua.remove_hook();
-    if let OnRequestResp::ExpectHttpBody(b) = backend {
-        Ok(b.upstream.into())
+    let handle_resp = |resp: &OnRequestResp| {
+        if let OnRequestResp::ExpectHttpBody(b) = resp {
+            Ok(b.upstream.to_string())
+        } else {
+            Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected response type"))
+        }
+    };
+
+    if let Some(t) = cache_ttl {
+        LUA_FN_CACHE.with_borrow_mut(|m| {
+            if !m.contains_key(host) {
+                m.insert(host.into(), (call_lua_fn(), Instant::now() + t.to_owned()));
+            }
+            let cached_value = m.get(host).unwrap();
+            handle_resp(&cached_value.0)
+        })
     } else {
-        Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected response type"))
+        handle_resp(&call_lua_fn())
     }
 }
 
@@ -106,7 +127,7 @@ async fn main() {
     let conf_source = fs::read("config.lua").unwrap();
     // lua setup
     let lua = Lua::new();
-    let req_handlers: Rc<RefCell<HashMap<Box<str>, LuaFunction>>> =
+    let req_handlers: Rc<RefCell<HashMap<Box<str>,(LuaFunction, Option<Duration>)>>> =
         Rc::new(RefCell::new(HashMap::new()));
     let proxy = Proxy {
         on_accept_fn: Rc::new(RefCell::new(None)),
@@ -132,7 +153,7 @@ async fn main() {
         let lua_pass = lua.clone();
         let handlers_pass = req_handlers.clone();
         monoio::spawn(async move {
-            let _ = forward_http(stream, lua_pass, handlers_pass).await;
+            let _r = forward_http(stream, lua_pass, handlers_pass).await;
         });
     }
 }
@@ -140,7 +161,7 @@ async fn main() {
 async fn forward_http(
     mut client: TcpStream,
     lua: Lua,
-    handlers: Rc<RefCell<HashMap<Box<str>, LuaFunction>>>,
+    handlers: Rc<RefCell<HashMap<Box<str>, (LuaFunction, Option<Duration>)>>>,
 ) -> io::Result<()> {
     let buf = vec![0u8; 8 * 1024];
     let mut hdr_buf: [MaybeUninit<(Range<usize>, Range<usize>)>; 64] =
@@ -157,6 +178,7 @@ async fn forward_http(
 
     let (host, req) = get_host_requset(&buf, &hdr_buf, &head, &req_line);
     let backend_addr = resolve_backend(host, client_t, req, context, lua, handlers).await?;
+
     let mut backend = get_conn(&backend_addr).await?;
 
     let in_buf = read_len.saturating_sub(head.header_offset);
@@ -177,7 +199,10 @@ async fn forward_http(
 
     let in_buf = read_len.saturating_sub(head.header_offset);
     if let Some(n) = head.content_len {
-        let buf = fwd(buf, &mut client, head.header_offset + in_buf.min(n)).await?;
+        let buf = fwd(buf, &mut client, head.start_of_header, 0).await?;
+        client.write_all("Connection: Close\r\n").await;
+        let buf = fwd(buf, &mut client, head.header_offset.saturating_sub(head.start_of_header), head.start_of_header).await?;
+        let buf = fwd(buf, &mut client, in_buf.min(n), head.header_offset).await?;
         let _ = send_n(buf, &mut backend, &mut client, n.saturating_sub(in_buf)).await?;
     } else if head.chunked {
         return Err(io::Error::new(
@@ -185,7 +210,7 @@ async fn forward_http(
             "we don't handle chunked yet",
         ));
     } else {
-        let _ = fwd(buf, &mut client, head.header_offset).await?;
+        let _ = fwd(buf, &mut client, head.header_offset, 0).await?;
     }
 
     put_conn(backend_addr, backend).await;
@@ -298,6 +323,7 @@ async fn read_headers(
                     HttpHead {
                         content_len: cl,
                         chunked,
+                        start_of_header: se,
                         header_count: h_count,
                         header_offset: header_end,
                     },
@@ -343,8 +369,8 @@ async fn fwd_or_reconnect(mut buf: Vec<u8>, dst: &mut TcpStream, n: usize) -> io
 
 // i think there is a problem here
 // we will lose our buffer on error
-async fn fwd(buf: Vec<u8>, dst: &mut TcpStream, n: usize) -> io::Result<Vec<u8>> {
-    let (res, view) = dst.write_all(buf.slice(..n)).await;
+async fn fwd(buf: Vec<u8>, dst: &mut TcpStream, n: usize, offset: usize) -> io::Result<Vec<u8>> {
+    let (res, view) = dst.write_all(buf.slice(offset..(offset+n))).await;
     res?;
     Ok(view.into_inner())
 }

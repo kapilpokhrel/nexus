@@ -2,6 +2,7 @@ use mlua::prelude::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Duration;
 
 pub struct Client {
     pub ip: String,
@@ -290,7 +291,7 @@ impl FromLua for OnRequestResp {
 
 pub struct Proxy {
     pub on_accept_fn: Rc<RefCell<Option<LuaFunction>>>,
-    pub req_handlers: Rc<RefCell<HashMap<Box<str>, LuaFunction>>>,
+    pub req_handlers: Rc<RefCell<HashMap<Box<str>, (LuaFunction, Option<Duration>)>>>,
     pub listen_addr: Box<str>
 }
 
@@ -301,15 +302,36 @@ impl LuaUserData for Proxy {
             Ok(())
         });
 
-        methods.add_method_mut("on_request", |_, this, (host, f): (Box<str>, LuaFunction)| {
+        methods.add_method_mut("on_request", |_, this, (host, f, cache_ttl): (Box<str>, LuaFunction, i32)| {
+            // cache_ttl = 0 means no cache
+            //
             // fn(client, request, context) -> OnRequestExpectHttpBodyResp | Deny | Redirect
-            this.req_handlers.borrow_mut().insert(host, f);
+            //
+            // showhow i need to put this cache value
+            let cache_ttl = if cache_ttl == 0 {
+                None
+            } else {
+                Some(Duration::from_secs(cache_ttl as u64))
+            };
+            this.req_handlers.borrow_mut().insert(host, (f, cache_ttl));
             Ok(())
         });
 
         methods.add_method_mut("on_accept", |_, this, f: LuaFunction| {
             this.on_accept_fn.replace(Some(f));
             Ok(())
+        });
+
+        methods.add_method("resp_expect_httpbody", |lua, _, upstream: Box<str>| {
+            let resp = OnRequestExpectHttpBodyResp {
+                upstream,
+                max_body_size: 1048576,
+                proxy_read_timeout: Some(30),
+                client_body_timeout: Some(30),
+                cache: None,
+                headers_patch: None,
+            };
+            lua.create_userdata(resp)
         });
 
         methods.add_method("resp_expect_httpbody", |lua, _, upstream: Box<str>| {
@@ -363,7 +385,7 @@ mod tests {
         let mut hdrs: [(&str, &str); 64] = [("", ""); 64];
         hdrs[..headers.len()].copy_from_slice(&headers);
 
-        let req_handlers: Rc<RefCell<HashMap<Box<str>, LuaFunction>>> = Rc::new(RefCell::new(HashMap::new()));
+        let req_handlers: Rc<RefCell<HashMap<Box<str>, (LuaFunction, Option<Duration>)>>> = Rc::new(RefCell::new(HashMap::new()));
         let on_accept_fn: Rc<RefCell<Option<LuaFunction>>> = Rc::new(RefCell::new(None));
         let proxy = Proxy{
             req_handlers: req_handlers.clone(),
@@ -384,8 +406,8 @@ mod tests {
                 print(req.method, req.path)
                 resp = proxy:resp_expect_httpbody("127.0.0.1:8000")
                 resp:set_cache(60, "$url")
-                return resp
-            end)
+                return
+            end, 0)
 
             proxy:on_accept(function(client)
                 print("Accepted connection from", client.ip, client.port)
@@ -456,6 +478,7 @@ mod tests {
                 .borrow()
                 .get("example.com")
                 .unwrap()
+                .0
                 .call::<OnRequestResp>((client, req, context));
             println!("{:?}", resp);
             Ok(())

@@ -1,5 +1,6 @@
 # pip install aiohttp
 from aiohttp import web
+import sys
 
 async def handler(request):
     return web.Response(
@@ -11,4 +12,5 @@ app = web.Application()
 app.router.add_route("*", "/", handler)
 app.router.add_route("*", "/{tail:.*}", handler)
 
-web.run_app(app, host="0.0.0.0", port=8000)
+port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
+web.run_app(app, host="0.0.0.0", port=port)
