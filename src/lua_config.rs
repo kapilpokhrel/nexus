@@ -1,6 +1,7 @@
 use mlua::prelude::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -249,6 +250,20 @@ impl LuaUserData for OnRequestExpectHttpBodyResp {
             });
             Ok(())
         });
+
+        methods.add_method_mut("add_header", |_, this, (key, val): (Box<str>, Box<str>)| {
+            this.headers_patch.get_or_insert(
+                HeadersPatchBlock { add_headers: HashMap::new(), remove_headers: Vec::new() }
+            ).add_headers.insert(key, val);
+            Ok(())
+        });
+
+        methods.add_method_mut("remove_header", |_, this, key: Box<str>| {
+            this.headers_patch.get_or_insert(
+                HeadersPatchBlock { add_headers: HashMap::new(), remove_headers: Vec::new() }
+            ).remove_headers.push(key);
+            Ok(())
+        })
     }
 }
 
