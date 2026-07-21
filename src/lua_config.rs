@@ -14,7 +14,7 @@ fn ip_location(ip: impl Into<String>) -> String {
     "XX".to_string()
 }
 
-impl LuaUserData for Client {
+impl LuaUserData for &Client {
     fn add_fields<F: LuaUserDataFields<Self>>(fields: &mut F) {
         fields.add_field_method_get("ip", |lua, this| lua.create_string(this.ip.as_str()));
         fields.add_field_method_get("port", |_, this| Ok(this.port));
@@ -177,8 +177,29 @@ impl FromLua for OnAcceptResp {
     }
 }
 
-pub struct Context;
-impl LuaUserData for Context {}
+pub struct Context {
+    pub ctx: HashMap<Box<str>, LuaValue>
+}
+
+impl Context {
+    pub fn new() -> Self {
+        Context{
+            ctx: HashMap::new()
+        }
+    }
+}
+
+impl LuaUserData for &Context {
+    fn add_methods<M: LuaUserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("get", |_, this, key: Box<str>| {
+            if let Some(v) = this.ctx.get(&key) {
+                Ok(v)
+            } else {
+                Ok(&LuaNil)
+            }
+        });
+    }
+}
 
 pub struct Request<'buf> {
     pub method: &'buf str,
@@ -187,7 +208,7 @@ pub struct Request<'buf> {
     pub headers_count: usize,
 }
 
-impl<'buf> LuaUserData for Request<'buf> {
+impl<'buf> LuaUserData for &Request<'buf> {
     fn add_fields<F: LuaUserDataFields<Self>>(fields: &mut F) {
         fields.add_field_method_get("method", |lua, this| lua.create_string(this.method));
         fields.add_field_method_get("path", |lua, this| lua.create_string(this.path));
@@ -198,6 +219,17 @@ impl<'buf> LuaUserData for Request<'buf> {
                 table.set(k, v)?;
             }
             Ok(table)
+        });
+    }
+    fn add_methods<M: LuaUserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("header", |lua, this, h: Box<str>| {
+            for i in 0..this.headers_count {
+                let (k, v) = this.headers[i];
+                if k == &*h {
+                    return lua.create_string(v)
+                }
+            }
+            lua.create_string("")
         });
     }
 }
@@ -400,6 +432,13 @@ mod tests {
         let mut hdrs: [(&str, &str); 64] = [("", ""); 64];
         hdrs[..headers.len()].copy_from_slice(&headers);
 
+        let req = Request {
+            method,
+            headers: hdrs,
+            path,
+            headers_count: headers.len(),
+        };
+
         let req_handlers: Rc<RefCell<HashMap<Box<str>, (LuaFunction, Option<Duration>)>>> = Rc::new(RefCell::new(HashMap::new()));
         let on_accept_fn: Rc<RefCell<Option<LuaFunction>>> = Rc::new(RefCell::new(None));
         let proxy = Proxy{
@@ -421,7 +460,7 @@ mod tests {
                 print(req.method, req.path)
                 resp = proxy:resp_expect_httpbody("127.0.0.1:8000")
                 resp:set_cache(60, "$url")
-                return
+                return resp
             end, 0)
 
             proxy:on_accept(function(client)
@@ -447,19 +486,22 @@ mod tests {
         source.exec()?;
 
 
+        let client1 = Client{
+            ip: "127.0.0.1".into(),
+            port: 6969
+        };
+        let client2 = Client{
+            ip: "10.100.1.1".into(),
+            port: 6969
+        };
+        let client3 = Client {
+            ip: "192.168.1.1".into(),
+            port: 6969
+        };
         lua.scope(|scope| {
-            let client1 = scope.create_userdata(Client{
-                ip: "127.0.0.1".into(),
-                port: 6969
-            });
-            let client2 = scope.create_userdata(Client{
-                ip: "10.100.1.1".into(),
-                port: 6969
-            });
-            let client3 = scope.create_userdata(Client{
-                ip: "192.168.1.1".into(),
-                port: 6969
-            });
+            let client1 = scope.create_userdata(&client1);
+            let client2 = scope.create_userdata(&client2);
+            let client3 = scope.create_userdata(&client3);
 
             let resp = on_accept_fn.borrow().as_ref().unwrap().call::<OnAcceptResp>(client1)?;
             println!("{:?}", resp);
@@ -474,20 +516,11 @@ mod tests {
 
         println!();
 
+        let ctx = Context::new();
         lua.scope(|scope| {
-            let req = scope.create_userdata(Request{
-                method,
-                headers: hdrs,
-                path,
-                headers_count: headers.len(),
-            })?;
-
-            let client = scope.create_userdata(Client{
-                ip: "127.0.0.1".into(),
-                port: 6969
-            })?;
-
-            let context = scope.create_userdata(Context{})?;
+            let req = scope.create_userdata(&req)?;
+            let client = scope.create_userdata(&client1)?;
+            let context = scope.create_userdata(&ctx)?;
 
             let resp = req_handlers
                 .borrow()

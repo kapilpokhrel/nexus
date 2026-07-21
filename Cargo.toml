@@ -7,3 +7,4 @@ edition = "2024"
 httparse = "1.10.1"
 mlua = { version = "0.11.6", features = ["lua54", "macros", "async"] }
 monoio = "0.2.4"
+toml = "1.1.3"

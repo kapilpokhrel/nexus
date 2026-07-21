@@ -1,6 +1,8 @@
 mod lua_config;
+mod lua_module;
 
-use crate::lua_config::{Client, Context, OnRequestResp, Proxy, Request};
+use crate::lua_config::{Client, Context, HeadersPatchBlock, OnRequestResp, Proxy, Request};
+use crate::lua_module::{HookResult, ProxyModuleTable};
 use mlua::prelude::*;
 use monoio::buf::{IoBuf, IoBufMut};
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
@@ -61,14 +63,74 @@ async fn put_conn(backend_addr: String, s: TcpStream) {
     });
 }
 
+
+/// Deep-copies an arbitrary Lua value from its original state into a completely different Lua state.
+fn transfer_value_between_states(
+    val: LuaValue,
+    dest_lua: &Lua
+) -> mlua::Result<LuaValue> {
+    match val {
+        LuaValue::Nil => Ok(LuaValue::Nil),
+        LuaValue::Boolean(b) => Ok(LuaValue::Boolean(b)),
+        LuaValue::Integer(i) => Ok(LuaValue::Integer(i)),
+        LuaValue::Number(n) => Ok(LuaValue::Number(n)),
+
+        LuaValue::String(s) => {
+            // Extracts raw bytes without UTF-8 re-validation overhead
+            let bytes = s.as_bytes();
+            Ok(LuaValue::String(dest_lua.create_string(bytes)?))
+        }
+
+        LuaValue::Table(t) => {
+            let dest_table = dest_lua.create_table()?;
+            // Iterate over all arbitrary keys and LuaValues in the source table
+            for pair in t.pairs::<LuaValue, LuaValue>() {
+                let (k, v) = pair?;
+                let new_k = transfer_value_between_states(k, dest_lua)?;
+                let new_v = transfer_value_between_states(v, dest_lua)?;
+                dest_table.set(new_k, new_v)?;
+            }
+            Ok(LuaValue::Table(dest_table))
+        }
+
+        // Safety Fallback: Refuse to move state-bound system components
+        _ => Err(mlua::Error::RuntimeError(
+            "Cannot move functions, threads, or raw userdata pointers between independent states".into()
+        )),
+    }
+}
+
 async fn resolve_backend<'a>(
     host: &'a str,
     client: Client,
     req: Request<'a>,
-    context: Context,
+    mut context: Context,
     lua: Lua,
     handlers: Rc<RefCell<HashMap<Box<str>, (LuaFunction, Option<Duration>)>>>,
-) -> io::Result<String> {
+    module_table: Rc<ProxyModuleTable>,
+) -> io::Result<(String, Option<Vec<(String, String)>>)> {
+
+    for (_, module) in module_table.modules.iter() {
+        if let Some(f) = module.hook_handlers.borrow().get(host) {
+            let resp = module.lua.scope(|scope| {
+                let req = scope.create_userdata(&req).unwrap();
+                let client = scope.create_userdata(&client).unwrap();
+                let context_ud = scope.create_userdata(&context).unwrap();
+
+                let resp = f.call::<HookResult>((&client, &req, context_ud)).unwrap();
+                Ok(resp)
+            }).unwrap();
+            if let HookResult::ContinueWithCtx(update_ctx) = resp {
+                for (key, val) in update_ctx.updates {
+                    let v = transfer_value_between_states(val, &lua);
+                    if let Ok(val) = v {
+                        context.ctx.insert(key, val);
+                    }
+                }
+            }
+        }
+    }
+
     let handler_fn = handlers.borrow();
     let (lua_fn, cache_ttl) = handler_fn.get(host).unwrap();
 
@@ -90,11 +152,12 @@ async fn resolve_backend<'a>(
 
         let resp = lua.scope(|scope| {
             // benchmark shows that adding creating lua userdata takes significant time...
-            let req = scope.create_userdata(req)?;
-            let client = scope.create_userdata(client)?;
-            let context = scope.create_userdata(context)?;
+            let req = scope.create_userdata(&req).unwrap();
+            let client = scope.create_userdata(&client).unwrap();
+            let context_ud = scope.create_userdata(&context)?;
+
             lua_fn
-                .call::<OnRequestResp>((client, req, context))
+                .call::<OnRequestResp>((client, req, context_ud))
         }).unwrap();
         lua.remove_hook();
         resp
@@ -102,7 +165,15 @@ async fn resolve_backend<'a>(
 
     let handle_resp = |resp: &OnRequestResp| {
         if let OnRequestResp::ExpectHttpBody(b) = resp {
-            Ok(b.upstream.to_string())
+            if let Some(ref p) = b.headers_patch {
+                let mut add_headers: Vec<(String, String)> = Vec::with_capacity(p.add_headers.len());
+                for (k, v) in p.add_headers.iter() {
+                    add_headers.push((k.to_string(), v.to_string()));
+                }
+                Ok((b.upstream.to_string(), Some(add_headers)))
+            } else {
+                Ok((b.upstream.to_string(), None))
+            }
         } else {
             Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected response type"))
         }
@@ -126,7 +197,11 @@ async fn resolve_backend<'a>(
 async fn main() {
     let conf_source = fs::read("config.lua").unwrap();
     // lua setup
+
     let lua = Lua::new();
+
+    let module_table = Rc::new(ProxyModuleTable::new());
+
     let req_handlers: Rc<RefCell<HashMap<Box<str>,(LuaFunction, Option<Duration>)>>> =
         Rc::new(RefCell::new(HashMap::new()));
     let proxy = Proxy {
@@ -134,7 +209,6 @@ async fn main() {
         req_handlers: req_handlers.clone(),
         listen_addr: "".into(),
     };
-    let lua = Lua::new();
 
     let proxy_ud = lua.create_userdata(proxy).unwrap();
     lua.globals().set("proxy", proxy_ud).unwrap();
@@ -152,8 +226,9 @@ async fn main() {
         };
         let lua_pass = lua.clone();
         let handlers_pass = req_handlers.clone();
+        let module_table_pass = module_table.clone();
         monoio::spawn(async move {
-            let _r = forward_http(stream, lua_pass, handlers_pass).await;
+            let _r = forward_http(stream, lua_pass, handlers_pass, module_table_pass).await;
         });
     }
 }
@@ -162,6 +237,7 @@ async fn forward_http(
     mut client: TcpStream,
     lua: Lua,
     handlers: Rc<RefCell<HashMap<Box<str>, (LuaFunction, Option<Duration>)>>>,
+    module_table: Rc<ProxyModuleTable>
 ) -> io::Result<()> {
     let buf = vec![0u8; 8 * 1024];
     let mut hdr_buf: [MaybeUninit<(Range<usize>, Range<usize>)>; 64] =
@@ -174,10 +250,10 @@ async fn forward_http(
         ip: client.local_addr().unwrap().ip().to_string(),
         port: client.local_addr().unwrap().port(),
     };
-    let context = Context{};
+    let context = Context::new();
 
     let (host, req) = get_host_requset(&buf, &hdr_buf, &head, &req_line);
-    let backend_addr = resolve_backend(host, client_t, req, context, lua, handlers).await?;
+    let (backend_addr, header_add_vec) = resolve_backend(host, client_t, req, context, lua, handlers, module_table).await?;
 
     let mut backend = get_conn(&backend_addr).await?;
 
@@ -191,7 +267,14 @@ async fn forward_http(
             "we don't handle chunked yet",
         ));
     } else {
-        fwd_or_reconnect(buf, &mut backend, head.header_offset).await?
+        let buf = fwd_or_reconnect(buf, &mut backend, head.start_of_header).await?;
+        if let Some(headers) = header_add_vec {
+            for (k, v) in headers {
+                let line = format!("{k}: {v}\r\n").into_bytes();
+                backend.write_all(line).await;
+            }
+        }
+        fwd(buf, &mut backend, head.header_offset.saturating_sub(head.start_of_header), head.start_of_header).await?
     };
 
     // response
