@@ -1,1 +1,2 @@
 name="auth"
+requires=["lsqlite3"]

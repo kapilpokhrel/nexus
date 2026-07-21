@@ -31,7 +31,6 @@ local function b64decode(data)
 end
 
 local sqlite3 = require("lsqlite3")
-
 local db = sqlite3.open("/home/kapil/dev/conduit/users.db")
 
 function lookup_user(username)

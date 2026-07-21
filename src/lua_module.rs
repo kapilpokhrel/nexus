@@ -101,6 +101,14 @@ pub struct ProxyModuleTable {
     pub modules: HashMap<Box<str>, Rc<ProxyModule>>,
 }
 
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ModuleManifest {
+    name: String,
+    requires: Vec<String>
+}
+
 impl ProxyModuleTable {
     pub fn new() -> Self {
         let mut modules: HashMap<Box<str>, Rc<ProxyModule>> = HashMap::new();
@@ -120,14 +128,33 @@ impl ProxyModuleTable {
                         continue;
                     }
                     let manifest = std::fs::read_to_string(manifest_path).unwrap();
-                    let manifest: toml::Value = toml::from_str(&manifest).unwrap();
-                    let module_name = manifest["name"].as_str().unwrap();
+                    let manifest: ModuleManifest = toml::from_str(&manifest).unwrap();
+                    let module_name = manifest.name;
+                    let module_requires = manifest.requires;
                     let main_script = std::fs::read_to_string(main_path).unwrap();
 
-                    let lua = unsafe {Lua::unsafe_new()}; // need to load specific modules mentioned by manifest only
+
+                    let lua = unsafe { Lua::unsafe_new() };
+
+                    // Save the original require
+                    let original_require: LuaFunction = lua.globals().get("require").unwrap();
+
+                    let require = lua.create_function(move |_, name: String| {
+                        if module_requires.contains(&name.to_string()) {
+                            original_require.call::<LuaValue>(name)
+                        } else {
+                            Err(mlua::Error::RuntimeError(format!(
+                                "module '{}' is not permitted",
+                                name
+                            )))
+                        }
+                    }).unwrap();
+
+                    lua.globals().set("require", require);
+
                     let module = Rc::new(ProxyModule::new(lua.clone()));
                     let module_ud = lua.create_userdata(Module(module.clone())).unwrap();
-                    lua.globals().set(module_name, module_ud).unwrap();
+                    lua.globals().set(module_name.clone(), module_ud).unwrap();
                     lua.load(&main_script).exec().unwrap();
 
                     modules.insert(module_name.into(), module.clone());

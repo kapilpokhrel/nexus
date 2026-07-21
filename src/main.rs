@@ -76,14 +76,12 @@ fn transfer_value_between_states(
         LuaValue::Number(n) => Ok(LuaValue::Number(n)),
 
         LuaValue::String(s) => {
-            // Extracts raw bytes without UTF-8 re-validation overhead
             let bytes = s.as_bytes();
             Ok(LuaValue::String(dest_lua.create_string(bytes)?))
         }
 
         LuaValue::Table(t) => {
             let dest_table = dest_lua.create_table()?;
-            // Iterate over all arbitrary keys and LuaValues in the source table
             for pair in t.pairs::<LuaValue, LuaValue>() {
                 let (k, v) = pair?;
                 let new_k = transfer_value_between_states(k, dest_lua)?;
@@ -93,7 +91,6 @@ fn transfer_value_between_states(
             Ok(LuaValue::Table(dest_table))
         }
 
-        // Safety Fallback: Refuse to move state-bound system components
         _ => Err(mlua::Error::RuntimeError(
             "Cannot move functions, threads, or raw userdata pointers between independent states".into()
         )),
