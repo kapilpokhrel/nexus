@@ -177,33 +177,23 @@ use super::*;
 
     #[test]
     fn modules_load() -> LuaResult<()> {
-        let path = "/";
-        let method = "GET";
-        let headers = [("Host", "example.com"), ("ContentLength", "64")];
-        let mut hdrs: [(&str, &str); 64] = [("", ""); 64];
-        hdrs[..headers.len()].copy_from_slice(&headers);
-
         let lua = Lua::new();
         let module_table = ProxyModuleTable::new();
         let ctx = Context::new();
 
-        let req = Request {
-            method,
-            headers: hdrs,
-            path,
-            headers_count: headers.len(),
-        };
+        let mut headers: HashMap<String, String> = HashMap::new();
+        headers.insert("Host".into(), "example.com".into());
+        headers.insert("ContentLength".into(), "64".into());
 
-        let client = Client {
-            ip: "127.0.0.1".into(),
-            port: 6969
-        };
+        let req = Request::new("GET", "path", headers);
+
+        let client = Client::new("127.0.0.1", 6969);
         let _ = lua.scope(|scope| {
             for (name, module) in module_table.modules {
                 if let Some(f) = module.get_handler("example.com") {
-                    let req = scope.create_userdata(&req)?;
-                    let client = scope.create_userdata(&client)?;
-                    let context = scope.create_userdata(&ctx)?;
+                    let req = scope.create_userdata(req.clone())?;
+                    let client = scope.create_userdata(client.clone())?;
+                    let context = scope.create_userdata(ctx.clone())?;
                     let x = f.call::<HookResult>((client, req, context));
                     println!("{:?}, {:?}", name, x);
                 }

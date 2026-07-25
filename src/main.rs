@@ -1,18 +1,20 @@
 mod lua_config;
 mod lua_module;
 
-use crate::lua_config::{Client, Context, HeadersPatchBlock, OnRequestResp, Proxy, Request};
+use crate::lua_config::{Client, Context, HeadersPatchBlock, OnAcceptDenyResp, OnAcceptExpectHttpResp, OnAcceptFn, OnAcceptRedirectResp, OnAcceptResp, OnRequestExpectHttpBodyResp, OnRequestResp, Proxy, Request};
 use crate::lua_module::{HookResult, ProxyModuleTable};
 use mlua::prelude::*;
 use monoio::buf::{IoBuf, IoBufMut};
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::{TcpListener, TcpStream};
+use tealr::TypeWalker;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io;
 use std::mem::MaybeUninit;
 use std::ops::Range;
+use std::os::unix::process;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -100,7 +102,7 @@ fn transfer_value_between_states(
 async fn resolve_backend<'a>(
     host: &'a str,
     client: Client,
-    req: Request<'a>,
+    req: Request,
     mut context: Context,
     lua: Lua,
     handlers: Rc<RefCell<HashMap<Box<str>, (LuaFunction, Option<Duration>)>>>,
@@ -110,9 +112,9 @@ async fn resolve_backend<'a>(
     for (_, module) in module_table.modules.iter() {
         if let Some(f) = module.hook_handlers.borrow().get(host) {
             let resp = module.lua.scope(|scope| {
-                let req = scope.create_userdata(&req).unwrap();
-                let client = scope.create_userdata(&client).unwrap();
-                let context_ud = scope.create_userdata(&context).unwrap();
+                let req = scope.create_userdata(req.clone()).unwrap();
+                let client = scope.create_userdata(client.clone()).unwrap();
+                let context_ud = scope.create_userdata(context.clone()).unwrap();
 
                 let resp = f.call::<HookResult>((&client, &req, context_ud)).unwrap();
                 Ok(resp)
@@ -121,7 +123,7 @@ async fn resolve_backend<'a>(
                 for (key, val) in update_ctx.updates {
                     let v = transfer_value_between_states(val, &lua);
                     if let Ok(val) = v {
-                        context.ctx.insert(key, val);
+                        context.insert(key, val);
                     }
                 }
             }
@@ -149,9 +151,9 @@ async fn resolve_backend<'a>(
 
         let resp = lua.scope(|scope| {
             // benchmark shows that adding creating lua userdata takes significant time...
-            let req = scope.create_userdata(&req).unwrap();
-            let client = scope.create_userdata(&client).unwrap();
-            let context_ud = scope.create_userdata(&context)?;
+            let req = scope.create_userdata(req).unwrap();
+            let client = scope.create_userdata(client.clone()).unwrap();
+            let context_ud = scope.create_userdata(context)?;
 
             lua_fn
                 .call::<OnRequestResp>((client, req, context_ud))
@@ -161,7 +163,7 @@ async fn resolve_backend<'a>(
     };
 
     let handle_resp = |resp: &OnRequestResp| {
-        if let OnRequestResp::ExpectHttpBody(b) = resp {
+        if let OnRequestResp::OnRequestExpectHttpBodyResp(b) = resp {
             if let Some(ref p) = b.headers_patch {
                 let mut add_headers: Vec<(String, String)> = Vec::with_capacity(p.add_headers.len());
                 for (k, v) in p.add_headers.iter() {
@@ -192,6 +194,19 @@ async fn resolve_backend<'a>(
 #[allow(unused_variables)]
 #[monoio::main(threads = 8)]
 async fn main() {
+    let types = TypeWalker::new()
+        .process_type::<Proxy>()
+        .process_type::<Client>()
+        .process_type::<Request>()
+        .process_type::<Context>()
+        .process_type::<OnAcceptExpectHttpResp>()
+        .process_type::<OnAcceptDenyResp>()
+        .process_type::<OnAcceptRedirectResp>()
+        .process_type::<OnRequestExpectHttpBodyResp>();
+
+    let json = types.to_json().unwrap();
+    fs::write("conduit.json", json);
+
     let conf_source = fs::read("config.lua").unwrap();
     // lua setup
 
@@ -243,10 +258,7 @@ async fn forward_http(
     // request
     let (buf, head, req_line, read_len) = read_headers(buf, &mut client, &mut hdr_buf[..]).await?;
 
-    let client_t = Client {
-        ip: client.local_addr().unwrap().ip().to_string(),
-        port: client.local_addr().unwrap().port(),
-    };
+    let client_t = Client::new(client.local_addr().unwrap().ip().to_string(), client.local_addr().unwrap().port());
     let context = Context::new();
 
     let (host, req) = get_host_requset(&buf, &hdr_buf, &head, &req_line);
@@ -307,13 +319,14 @@ fn get_host_requset<'a>(
     hdr: &[MaybeUninit<(Range<usize>, Range<usize>)>; 64],
     head: &HttpHead,
     req_line: &RequestInfo,
-) -> (&'a str, Request<'a>) {
-    let mut hdrs = [("", ""); 64];
+) -> (&'a str, Request) {
+    let mut headers: HashMap<String, String> = HashMap::new();
     for i in 0..head.header_count.min(64) {
         let (nr, vr) = unsafe { hdr[i].assume_init_read() };
-        hdrs[i] = (unsafe { std::str::from_utf8_unchecked(&buf[nr]) }, unsafe {
-            std::str::from_utf8_unchecked(&buf[vr])
-        });
+        headers.insert(
+            unsafe { std::str::from_utf8_unchecked(&buf[nr]).into() },
+            unsafe { std::str::from_utf8_unchecked(&buf[vr]).into() }
+        );
     }
     let host =
         unsafe { std::str::from_utf8_unchecked(&buf[req_line.host.as_ref().unwrap().clone()]) };
@@ -323,12 +336,7 @@ fn get_host_requset<'a>(
         unsafe { std::str::from_utf8_unchecked(&buf[req_line.path.as_ref().unwrap().clone()]) };
     (
         host,
-        Request {
-            path,
-            method,
-            headers: hdrs,
-            headers_count: head.header_count,
-        },
+        Request::new(method, path, headers)
     )
 }
 
