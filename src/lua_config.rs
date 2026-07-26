@@ -363,6 +363,7 @@ pub type OnRequestFn = TypedFunction<(Client, Request, Context), OnRequestResp>;
 pub struct Proxy {
     pub on_accept_fn: Rc<RefCell<Option<LuaFunction>>>,
     pub req_handlers: Rc<RefCell<HashMap<Box<str>, (LuaFunction, Option<Duration>)>>>,
+    pub hooks: Rc<RefCell<HashMap<Box<str>, RefCell<Vec<String>>>>>,
     pub listen_addr: Box<str>
 }
 
@@ -370,6 +371,15 @@ impl TealData for Proxy {
     fn add_methods<M: TealDataMethods<Self>>(methods: &mut M) {
         methods.add_method_mut("listen_on", |_, this, addr: String| {
             this.listen_addr = addr.into();
+            Ok(())
+        });
+
+        methods.add_method_mut("register_hook", |_, this, (host, module_name, order): (String, String, usize)| {
+            let key: Box<str> = host.into();
+            if !this.hooks.borrow().contains_key(&key) {
+                this.hooks.borrow_mut().insert(key.clone(), RefCell::new(Vec::new()));
+            }
+            this.hooks.borrow().get(&key).unwrap().borrow_mut().insert(order, module_name);
             Ok(())
         });
 
@@ -452,10 +462,13 @@ use super::*;
 
         let req_handlers: Rc<RefCell<HashMap<Box<str>, (LuaFunction, Option<Duration>)>>> = Rc::new(RefCell::new(HashMap::new()));
         let on_accept_fn: Rc<RefCell<Option<LuaFunction>>> = Rc::new(RefCell::new(None));
+        let hooks: Rc<RefCell<HashMap<Box<str>, RefCell<Vec<String>>>>> = Rc::new(RefCell::new(HashMap::new()));
+
         let proxy = Proxy{
             req_handlers: req_handlers.clone(),
             on_accept_fn: on_accept_fn.clone(),
             listen_addr: "".into(),
+            hooks
         };
         let lua = Lua::new();
 

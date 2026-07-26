@@ -56,20 +56,16 @@ impl FromLua for HookResult {
 }
 
 pub struct ProxyModule {
-    pub hook_handlers: Rc<RefCell<HashMap<Box<str>, LuaFunction>>>,
+    pub hook_handler: RefCell<Option<LuaFunction>>,
     pub lua: Lua,
 }
 
 impl ProxyModule {
     pub fn new(lua: Lua) -> Self {
         ProxyModule {
-            hook_handlers: Rc::new(RefCell::new(HashMap::new())),
+            hook_handler: RefCell::new(None),
             lua
         }
-    }
-
-    pub fn get_handler(&self, host: &str) -> Option<LuaFunction> {
-        self.hook_handlers.borrow().get(host).cloned()
     }
 }
 
@@ -78,9 +74,9 @@ struct Module(Rc<ProxyModule>);
 
 impl LuaUserData for Module {
     fn add_methods<M: LuaUserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method_mut("add_incomming_hook", |_, this, (host, f): (Box<str>, LuaFunction)| {
+        methods.add_method_mut("add_incomming_hook", |_, this, f: LuaFunction| {
             // f must return
-            this.0.hook_handlers.borrow_mut().insert(host, f);
+            this.0.hook_handler.replace(Some(f));
             Ok(())
         });
 
@@ -190,7 +186,7 @@ use super::*;
         let client = Client::new("127.0.0.1", 6969);
         let _ = lua.scope(|scope| {
             for (name, module) in module_table.modules {
-                if let Some(f) = module.get_handler("example.com") {
+                if let Some(f) = &*module.hook_handler.borrow() {
                     let req = scope.create_userdata(req.clone())?;
                     let client = scope.create_userdata(client.clone())?;
                     let context = scope.create_userdata(ctx.clone())?;

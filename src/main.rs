@@ -2,7 +2,7 @@ mod lua_config;
 mod lua_module;
 
 use crate::lua_config::{Client, Context, HeadersPatchBlock, OnAcceptDenyResp, OnAcceptExpectHttpResp, OnAcceptFn, OnAcceptRedirectResp, OnAcceptResp, OnRequestExpectHttpBodyResp, OnRequestResp, Proxy, Request};
-use crate::lua_module::{HookResult, ProxyModuleTable};
+use crate::lua_module::{HookResult, ProxyModule, ProxyModuleTable};
 use mlua::prelude::*;
 use monoio::buf::{IoBuf, IoBufMut};
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
@@ -106,11 +106,14 @@ async fn resolve_backend<'a>(
     mut context: Context,
     lua: Lua,
     handlers: Rc<RefCell<HashMap<Box<str>, (LuaFunction, Option<Duration>)>>>,
+    hooks: Rc<RefCell<HashMap<Box<str>, RefCell<Vec<String>>>>>,
     module_table: Rc<ProxyModuleTable>,
 ) -> io::Result<(String, Option<Vec<(String, String)>>)> {
+    let hooks = hooks.borrow_mut();
+    let host_hooks = hooks.get(host);
 
-    for (_, module) in module_table.modules.iter() {
-        if let Some(f) = module.hook_handlers.borrow().get(host) {
+    let mut call_hook = |module: &ProxyModule| {
+        if let Some(f) = &*module.hook_handler.borrow() {
             let resp = module.lua.scope(|scope| {
                 let req = scope.create_userdata(req.clone()).unwrap();
                 let client = scope.create_userdata(client.clone()).unwrap();
@@ -127,6 +130,14 @@ async fn resolve_backend<'a>(
                     }
                 }
             }
+        }
+    };
+
+    if let Some(h) = host_hooks {
+        for m_name in h.borrow().iter() {
+            let mn: Box<str> = m_name.to_string().into();
+            let module = module_table.modules.get(&mn).unwrap();
+            call_hook(module);
         }
     }
 
@@ -216,10 +227,14 @@ async fn main() {
 
     let req_handlers: Rc<RefCell<HashMap<Box<str>,(LuaFunction, Option<Duration>)>>> =
         Rc::new(RefCell::new(HashMap::new()));
+
+    let hooks: Rc<RefCell<HashMap<Box<str>, RefCell<Vec<String>>>>> = Rc::new(RefCell::new(HashMap::new()));
+
     let proxy = Proxy {
         on_accept_fn: Rc::new(RefCell::new(None)),
         req_handlers: req_handlers.clone(),
         listen_addr: "".into(),
+        hooks: hooks.clone()
     };
 
     let proxy_ud = lua.create_userdata(proxy).unwrap();
@@ -239,8 +254,9 @@ async fn main() {
         let lua_pass = lua.clone();
         let handlers_pass = req_handlers.clone();
         let module_table_pass = module_table.clone();
+        let hooks_pass = hooks.clone();
         monoio::spawn(async move {
-            let _r = forward_http(stream, lua_pass, handlers_pass, module_table_pass).await;
+            let _r = forward_http(stream, lua_pass, handlers_pass, hooks_pass, module_table_pass).await;
         });
     }
 }
@@ -249,6 +265,7 @@ async fn forward_http(
     mut client: TcpStream,
     lua: Lua,
     handlers: Rc<RefCell<HashMap<Box<str>, (LuaFunction, Option<Duration>)>>>,
+    hooks: Rc<RefCell<HashMap<Box<str>, RefCell<Vec<String>>>>>,
     module_table: Rc<ProxyModuleTable>
 ) -> io::Result<()> {
     let buf = vec![0u8; 8 * 1024];
@@ -262,7 +279,7 @@ async fn forward_http(
     let context = Context::new();
 
     let (host, req) = get_host_requset(&buf, &hdr_buf, &head, &req_line);
-    let (backend_addr, header_add_vec) = resolve_backend(host, client_t, req, context, lua, handlers, module_table).await?;
+    let (backend_addr, header_add_vec) = resolve_backend(host, client_t, req, context, lua, handlers, hooks, module_table).await?;
 
     let mut backend = get_conn(&backend_addr).await?;
 

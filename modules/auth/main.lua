@@ -45,7 +45,7 @@ function lookup_user(username)
     end
 end
 
-auth:add_incomming_hook("example.com", function(client, req, context)
+auth:add_incomming_hook(function(client, req, context)
     local authz = req:header("Authorization")
     local resp = auth:resp_update_ctx()
     if not authz then
