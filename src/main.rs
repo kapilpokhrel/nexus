@@ -1,7 +1,7 @@
 mod lua_config;
 mod lua_module;
 
-use crate::lua_config::{Client, Context, HeadersPatchBlock, OnAcceptDenyResp, OnAcceptExpectHttpResp, OnAcceptFn, OnAcceptRedirectResp, OnAcceptResp, OnRequestExpectHttpBodyResp, OnRequestResp, Proxy, Request};
+use crate::lua_config::{CachedValue, Client, Context, HeadersPatchBlock, Hook, HookCacheKeyKind, OnAcceptDenyResp, OnAcceptExpectHttpResp, OnAcceptFn, OnAcceptRedirectResp, OnAcceptResp, OnRequestExpectHttpBodyResp, OnRequestResp, Proxy, Request};
 use crate::lua_module::{HookResult, ProxyModule, ProxyModuleTable};
 use mlua::prelude::*;
 use monoio::buf::{IoBuf, IoBufMut};
@@ -39,7 +39,6 @@ const MAX_IDLE: usize = 15;
 
 thread_local! {
     static CONN_POOL: RefCell<HashMap<String, VecDeque<TcpStream>>> = RefCell::new(HashMap::new());
-    static LUA_FN_CACHE: RefCell<HashMap<String, (OnRequestResp, Instant)>> = RefCell::new(HashMap::new());
 }
 
 async fn get_conn(backend_addr: &String) -> io::Result<TcpStream> {
@@ -105,62 +104,117 @@ async fn resolve_backend<'a>(
     req: Request,
     mut context: Context,
     lua: Lua,
-    handlers: Rc<RefCell<HashMap<Box<str>, (LuaFunction, Option<Duration>)>>>,
-    hooks: Rc<RefCell<HashMap<Box<str>, RefCell<Vec<String>>>>>,
+    handlers: Rc<RefCell<HashMap<Box<str>, LuaFunction>>>,
+    hooks: Rc<RefCell<HashMap<Box<str>, RefCell<Vec<Hook>>>>>,
     module_table: Rc<ProxyModuleTable>,
 ) -> io::Result<(String, Option<Vec<(String, String)>>)> {
     let hooks = hooks.borrow_mut();
     let host_hooks = hooks.get(host);
 
-    let mut call_hook = |module: &ProxyModule| {
-        if let Some(f) = &*module.hook_handler.borrow() {
-            let resp = module.lua.scope(|scope| {
-                let req = scope.create_userdata(req.clone()).unwrap();
-                let client = scope.create_userdata(client.clone()).unwrap();
-                let context_ud = scope.create_userdata(context.clone()).unwrap();
+    //let mut call_hook = |module: &ProxyModule| {
+    //    if let Some(f) = &*module.hook_handler.borrow() {
+    //        let resp = module.lua.scope(|scope| {
+    //            let req = scope.create_userdata(req.clone()).unwrap();
+    //            let client = scope.create_userdata(client.clone()).unwrap();
+    //            let context_ud = scope.create_userdata(context.clone()).unwrap();
 
-                let resp = f.call::<HookResult>((&client, &req, context_ud)).unwrap();
-                Ok(resp)
-            }).unwrap();
-            if let HookResult::ContinueWithCtx(update_ctx) = resp {
-                for (key, val) in update_ctx.updates {
-                    let v = transfer_value_between_states(val, &lua);
-                    if let Ok(val) = v {
-                        context.insert(key, val);
-                    }
+    //            let resp = f.call::<HookResult>((&client, &req, context_ud)).unwrap();
+    //            Ok(resp)
+    //        }).unwrap();
+    //        if let HookResult::ContinueWithCtx(update_ctx) = resp {
+    //            for (key, val) in update_ctx.updates {
+    //                let v = transfer_value_between_states(val, &lua);
+    //                if let Ok(val) = v {
+    //                    context.insert(key, val);
+    //                }
+    //            }
+    //        }
+    //    }
+    //};
+    //
+    lua.set_hook(
+        LuaHookTriggers {
+            every_line: false,
+            on_calls: false,
+            on_returns: false,
+            // Check every 1000 VM instructions
+            every_nth_instruction: Some(1000),
+        },
+        move |_, _| {
+            // error after 1000 VM instructions
+            Err(mlua::Error::RuntimeError("timeout exceeded".to_string()))
+            // or we can check elapsed time and if not timeout, `Ok(LuaVmState::Continue)`
+        },
+    ).unwrap();
+
+    // if any hook cache is found expired, we will invalidate all hooks after it for this request since they might depend on it
+    let mut call_hook = |h: &mut Hook, invalidated: bool| {
+        let mut newly_called = invalidated;
+
+        let cache_key = if let Some(ref k) = h.cache_key_kind {
+            Some(match k {
+                HookCacheKeyKind::Url=> req.0.path.clone(),
+                HookCacheKeyKind::Header(h) => req.0.headers.get(h).cloned().unwrap_or_default(),
+                HookCacheKeyKind::Ip => client.0.ip.clone(),
+                HookCacheKeyKind::Custom(c) => c.clone(),
+            })
+        } else {
+            None
+        };
+        let cached_result = if !invalidated && let Some(ref k) = cache_key {
+            h.cached_result.get(k)
+        } else {
+            None
+        };
+
+        let resp: Option<&HookResult> = if let Some(t) = cached_result.as_ref() && let Some(r) = t.get() {
+            Some(r)
+        } else {
+            let mn: Box<str> = h.name.to_string().into();
+            let module = module_table.modules.get(&mn).unwrap();
+            if let Some(f) = &*module.hook_handler.borrow() {
+
+                let resp = module.lua.scope(|scope| {
+                    let req = scope.create_userdata(req.clone()).unwrap();
+                    let client = scope.create_userdata(client.clone()).unwrap();
+                    let context_ud = scope.create_userdata(context.clone()).unwrap();
+
+                    let resp = f.call::<HookResult>((&client, &req, context_ud)).unwrap();
+                    Ok(resp)
+                }).unwrap();
+                newly_called = true;
+
+                if let Some(t) = h.cache_ttl {
+                    h.cached_result.insert(cache_key.unwrap().clone(), CachedValue::new(resp.clone(), t));
+                }
+                Some(&resp.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(r) = resp && let HookResult::ContinueWithCtx(update_ctx) = r {
+            for (key, val) in update_ctx.updates.iter() {
+                let v = transfer_value_between_states(val.clone(), &lua);
+                if let Ok(val) = v {
+                    context.insert(key.clone(), val);
                 }
             }
         }
+        newly_called
     };
 
+    let mut invalidated = false;
     if let Some(h) = host_hooks {
-        for m_name in h.borrow().iter() {
-            let mn: Box<str> = m_name.to_string().into();
-            let module = module_table.modules.get(&mn).unwrap();
-            call_hook(module);
+        for h_t in h.borrow_mut().iter_mut() {
+            invalidated = call_hook(h_t, invalidated);
         }
     }
 
     let handler_fn = handlers.borrow();
-    let (lua_fn, cache_ttl) = handler_fn.get(host).unwrap();
+    let lua_fn = handler_fn.get(host).unwrap();
 
     let call_lua_fn = || {
-        lua.set_hook(
-            LuaHookTriggers {
-                every_line: false,
-                on_calls: false,
-                on_returns: false,
-                // Check every 1000 VM instructions
-                every_nth_instruction: Some(1000),
-            },
-            move |_, _| {
-                // error after 1000 VM instructions
-                Err(mlua::Error::RuntimeError("timeout exceeded".to_string()))
-                // or we can check elapsed time and if not timeout, `Ok(LuaVmState::Continue)`
-            },
-        ).unwrap();
-
-        let resp = lua.scope(|scope| {
+        lua.scope(|scope| {
             // benchmark shows that adding creating lua userdata takes significant time...
             let req = scope.create_userdata(req).unwrap();
             let client = scope.create_userdata(client.clone()).unwrap();
@@ -168,9 +222,7 @@ async fn resolve_backend<'a>(
 
             lua_fn
                 .call::<OnRequestResp>((client, req, context_ud))
-        }).unwrap();
-        lua.remove_hook();
-        resp
+        }).unwrap()
     };
 
     let handle_resp = |resp: &OnRequestResp| {
@@ -189,17 +241,8 @@ async fn resolve_backend<'a>(
         }
     };
 
-    if let Some(t) = cache_ttl {
-        LUA_FN_CACHE.with_borrow_mut(|m| {
-            if !m.contains_key(host) {
-                m.insert(host.into(), (call_lua_fn(), Instant::now() + t.to_owned()));
-            }
-            let cached_value = m.get(host).unwrap();
-            handle_resp(&cached_value.0)
-        })
-    } else {
-        handle_resp(&call_lua_fn())
-    }
+    lua.remove_hook();
+    handle_resp(&call_lua_fn())
 }
 
 #[allow(unused_variables)]
@@ -225,10 +268,10 @@ async fn main() {
 
     let module_table = Rc::new(ProxyModuleTable::new());
 
-    let req_handlers: Rc<RefCell<HashMap<Box<str>,(LuaFunction, Option<Duration>)>>> =
+    let req_handlers: Rc<RefCell<HashMap<Box<str>,LuaFunction>>> =
         Rc::new(RefCell::new(HashMap::new()));
 
-    let hooks: Rc<RefCell<HashMap<Box<str>, RefCell<Vec<String>>>>> = Rc::new(RefCell::new(HashMap::new()));
+    let hooks: Rc<RefCell<HashMap<Box<str>, RefCell<Vec<Hook>>>>> = Rc::new(RefCell::new(HashMap::new()));
 
     let proxy = Proxy {
         on_accept_fn: Rc::new(RefCell::new(None)),
@@ -264,8 +307,8 @@ async fn main() {
 async fn forward_http(
     mut client: TcpStream,
     lua: Lua,
-    handlers: Rc<RefCell<HashMap<Box<str>, (LuaFunction, Option<Duration>)>>>,
-    hooks: Rc<RefCell<HashMap<Box<str>, RefCell<Vec<String>>>>>,
+    handlers: Rc<RefCell<HashMap<Box<str>, LuaFunction>>>,
+    hooks: Rc<RefCell<HashMap<Box<str>, RefCell<Vec<Hook>>>>>,
     module_table: Rc<ProxyModuleTable>
 ) -> io::Result<()> {
     let buf = vec![0u8; 8 * 1024];

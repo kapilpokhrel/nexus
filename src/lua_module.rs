@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CtxUpdate {
     pub updates: HashMap<Box<str>, LuaValue>
 }
@@ -19,11 +19,11 @@ impl LuaUserData for CtxUpdate {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PassResp();
 impl LuaUserData for PassResp {}
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum HookResult {
     ContinueWithCtx(CtxUpdate),
     // should add deny and redirect too

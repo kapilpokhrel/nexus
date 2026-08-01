@@ -1,19 +1,22 @@
 use mlua::prelude::*;
 use tealr::mlu::{FromLuaExact, FromToLua, TealData, TealDataMethods, TypedFunction};
+use toml::de;
 use std::{cell::RefCell, fmt::Debug};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tealr::{ToTypename, create_union_mlua};
 
-struct ClientInner {
+use crate::lua_module::HookResult;
+
+pub struct ClientInner {
     pub ip: String,
     pub port: u16
 }
 
 #[derive(Clone, tealr::mlu::UserData, ToTypename)]
-pub struct Client(Arc<ClientInner>);
+pub struct Client(pub Arc<ClientInner>);
 
 impl Client {
     pub fn new(ip: impl Into<String>, port: u16) -> Self {
@@ -216,14 +219,14 @@ impl tealr::mlu::TealData for Context {
 
 
 #[derive(Debug)]
-struct RequestInner {
+pub struct RequestInner {
     pub method: String,
     pub path: String,
     pub headers: HashMap<String, String>
 }
 
 #[derive(Clone, Debug, tealr::mlu::UserData, ToTypename)]
-pub struct Request(Arc<RequestInner>);
+pub struct Request(pub Arc<RequestInner>);
 
 impl Request {
     pub fn new(method: impl Into<String>, path: impl Into<String>, headers: HashMap<String, String>) -> Self {
@@ -359,11 +362,50 @@ impl std::fmt::Debug for OnRequestResp {
 pub type OnAcceptFn = TypedFunction<Client, OnAcceptResp>;
 pub type OnRequestFn = TypedFunction<(Client, Request, Context), OnRequestResp>;
 
+#[derive(Debug)]
+pub struct CachedValue<T> {
+    value: T,
+    expiry: Instant,
+}
+
+impl<T> CachedValue<T> {
+    pub fn new(value: T, ttl: Duration) -> Self {
+        Self {
+            value,
+            expiry: Instant::now() + ttl,
+        }
+    }
+
+    pub fn get(&self) -> Option<&T> {
+        if Instant::now() < self.expiry {
+            Some(&self.value)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum HookCacheKeyKind {
+    Url,
+    Ip,
+    Header(String),
+    Custom(String),
+}
+
+#[derive(Debug)]
+pub struct Hook {
+    pub name: String,
+    pub cache_ttl: Option<Duration>,
+    pub cache_key_kind: Option<HookCacheKeyKind>,
+    pub cached_result: HashMap<String, CachedValue<HookResult>>,
+}
+
 #[derive(Debug, tealr::mlu::UserData, ToTypename)]
 pub struct Proxy {
     pub on_accept_fn: Rc<RefCell<Option<LuaFunction>>>,
-    pub req_handlers: Rc<RefCell<HashMap<Box<str>, (LuaFunction, Option<Duration>)>>>,
-    pub hooks: Rc<RefCell<HashMap<Box<str>, RefCell<Vec<String>>>>>,
+    pub req_handlers: Rc<RefCell<HashMap<Box<str>, LuaFunction>>>,
+    pub hooks: Rc<RefCell<HashMap<Box<str>, RefCell<Vec<Hook>>>>>,
     pub listen_addr: Box<str>
 }
 
@@ -374,27 +416,46 @@ impl TealData for Proxy {
             Ok(())
         });
 
-        methods.add_method_mut("register_hook", |_, this, (host, module_name, order): (String, String, usize)| {
+        // will introduce a new cache type
+        methods.add_method_mut("register_hook", |_, this, (host, module_name, order, cache_ttl, cache_key): (String, String, usize, i32, Option<String>)| {
             let key: Box<str> = host.into();
             if !this.hooks.borrow().contains_key(&key) {
                 this.hooks.borrow_mut().insert(key.clone(), RefCell::new(Vec::new()));
             }
-            this.hooks.borrow().get(&key).unwrap().borrow_mut().insert(order, module_name);
-            Ok(())
-        });
-
-        methods.add_method_mut("on_request", |_, this, (host, f, cache_ttl): (String, OnRequestFn, i32)| {
-            // cache_ttl = 0 means no cache
-            //
-            // fn(client, request, context) -> OnRequestExpectHttpBodyResp | Deny | Redirect
-            //
-            // showhow i need to put this cache value
             let cache_ttl = if cache_ttl == 0 {
                 None
             } else {
                 Some(Duration::from_secs(cache_ttl as u64))
             };
-            this.req_handlers.borrow_mut().insert(host.into(), (f.into(), cache_ttl));
+
+            let cache_key_kind = match cache_key {
+                Some(k) => {
+                    if k == "$url" {
+                        Some(HookCacheKeyKind::Url)
+                    } else if k == "$ip" {
+                        Some(HookCacheKeyKind::Ip)
+                    } else if k.starts_with("$header:") {
+                        let header_name = k.trim_start_matches("$header:").to_string();
+                        Some(HookCacheKeyKind::Header(header_name))
+                    } else {
+                        Some(HookCacheKeyKind::Custom(k))
+                    }
+                }
+                None => None,
+            };
+
+            let hook = Hook {
+                name: module_name,
+                cache_ttl,
+                cache_key_kind,
+                cached_result: HashMap::new(),
+            };
+            this.hooks.borrow().get(&key).unwrap().borrow_mut().insert(order, hook);
+            Ok(())
+        });
+
+        methods.add_method_mut("on_request", |_, this, (host, f): (String, OnRequestFn)| {
+            this.req_handlers.borrow_mut().insert(host.into(), f.into());
             Ok(())
         });
 
@@ -460,9 +521,9 @@ use super::*;
 
         let req = Request::new("GET", "path", headers);
 
-        let req_handlers: Rc<RefCell<HashMap<Box<str>, (LuaFunction, Option<Duration>)>>> = Rc::new(RefCell::new(HashMap::new()));
+        let req_handlers: Rc<RefCell<HashMap<Box<str>, LuaFunction>>> = Rc::new(RefCell::new(HashMap::new()));
         let on_accept_fn: Rc<RefCell<Option<LuaFunction>>> = Rc::new(RefCell::new(None));
-        let hooks: Rc<RefCell<HashMap<Box<str>, RefCell<Vec<String>>>>> = Rc::new(RefCell::new(HashMap::new()));
+        let hooks: Rc<RefCell<HashMap<Box<str>, RefCell<Vec<Hook>>>>> = Rc::new(RefCell::new(HashMap::new()));
 
         let proxy = Proxy{
             req_handlers: req_handlers.clone(),
@@ -485,7 +546,7 @@ use super::*;
                 resp = proxy:resp_expect_httpbody("127.0.0.1:8000")
                 resp:set_cache(60, "$url")
                 return resp
-            end, 0)
+            end)
 
             proxy:on_accept(function(client)
                 print("Accepted connection from", client.ip, client.port)
@@ -541,7 +602,6 @@ use super::*;
                 .borrow()
                 .get("example.com")
                 .unwrap()
-                .0
                 .call::<OnRequestResp>((client, req, context));
             println!("{:?}", resp);
             Ok(())
