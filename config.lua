@@ -1,4 +1,4 @@
-proxy:register_hook("example.com", "auth", 0, 60, "$header:Authorization")
+proxy:register_hook("example.com", "auth", 60, "$header:Authorization")
 proxy:on_request("example.com", function(client, req, context)
     resp = proxy:resp_expect_httpbody("127.0.0.1:8000")
     user = context:get("user")

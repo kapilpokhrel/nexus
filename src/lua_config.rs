@@ -417,7 +417,7 @@ impl TealData for Proxy {
         });
 
         // will introduce a new cache type
-        methods.add_method_mut("register_hook", |_, this, (host, module_name, order, cache_ttl, cache_key): (String, String, usize, i32, Option<String>)| {
+        methods.add_method_mut("register_hook", |_, this, (host, module_name, cache_ttl, cache_key): (String, String, usize, Option<String>)| {
             let key: Box<str> = host.into();
             if !this.hooks.borrow().contains_key(&key) {
                 this.hooks.borrow_mut().insert(key.clone(), RefCell::new(Vec::new()));
@@ -450,7 +450,7 @@ impl TealData for Proxy {
                 cache_key_kind,
                 cached_result: HashMap::new(),
             };
-            this.hooks.borrow().get(&key).unwrap().borrow_mut().insert(order, hook);
+            this.hooks.borrow().get(&key).unwrap().borrow_mut().insert(0, hook);
             Ok(())
         });
 

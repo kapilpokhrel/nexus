@@ -177,9 +177,8 @@ async fn resolve_backend<'a>(
                 let resp = module.lua.scope(|scope| {
                     let req = scope.create_userdata(req.clone()).unwrap();
                     let client = scope.create_userdata(client.clone()).unwrap();
-                    let context_ud = scope.create_userdata(context.clone()).unwrap();
 
-                    let resp = f.call::<HookResult>((&client, &req, context_ud)).unwrap();
+                    let resp = f.call::<HookResult>((&client, &req)).unwrap();
                     Ok(resp)
                 }).unwrap();
                 newly_called = true;
