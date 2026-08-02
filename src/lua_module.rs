@@ -184,8 +184,8 @@ use super::*;
         let req = Request::new("GET", "path", headers);
 
         let client = Client::new("127.0.0.1", 6969);
-        let _ = lua.scope(|scope| {
-            for (name, module) in module_table.modules {
+        for (name, module) in module_table.modules {
+            let _ = module.lua.scope(|scope| {
                 if let Some(f) = &*module.hook_handler.borrow() {
                     let req = scope.create_userdata(req.clone())?;
                     let client = scope.create_userdata(client.clone())?;
@@ -193,9 +193,9 @@ use super::*;
                     let x = f.call::<HookResult>((client, req, context));
                     println!("{:?}, {:?}", name, x);
                 }
-            }
-            Ok(())
-        });
+                Ok(())
+            });
+        }
         Ok(())
     }
 }

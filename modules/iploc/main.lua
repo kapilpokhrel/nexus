@@ -1,3 +1,5 @@
+-- https://www.ip2location.com/documentation/ip2location-libraries/lua/get-started
+
 ip2location = require('ip2location')
 local ip2loc = ip2location:new('/home/kapil/IP2LOCATION-LITE-DB1.BIN')
 

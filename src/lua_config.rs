@@ -57,7 +57,7 @@ pub struct OnAcceptExpectHttpResp {
 impl FromLuaExact for OnAcceptExpectHttpResp {
     fn from_lua_exact(lua_value: LuaValue, _lua: &Lua) -> LuaResult<Self> {
         match lua_value {
-            LuaValue::UserData(ud) => {
+            LuaValue::UserData(ud) if ud.is::<Self>() => {
                 let resp: OnAcceptExpectHttpResp = ud.take::<Self>()?;
                 Ok(resp)
             }
@@ -125,7 +125,7 @@ impl TealData for OnAcceptDenyResp {
 impl FromLuaExact for OnAcceptDenyResp {
     fn from_lua_exact(lua_value: LuaValue, _lua: &Lua) -> LuaResult<Self> {
         match lua_value {
-            LuaValue::UserData(ud) => {
+            LuaValue::UserData(ud) if ud.is::<Self>() => {
                 let resp: OnAcceptDenyResp = ud.take::<Self>()?;
                 Ok(resp)
             }
@@ -154,7 +154,7 @@ impl tealr::mlu::TealData for OnAcceptRedirectResp {
 impl FromLuaExact for OnAcceptRedirectResp {
     fn from_lua_exact(lua_value: LuaValue, _lua: &Lua) -> LuaResult<Self> {
         match lua_value {
-            LuaValue::UserData(ud) => {
+            LuaValue::UserData(ud) if ud.is::<Self>() => {
                 let resp: OnAcceptRedirectResp = ud.take::<Self>()?;
                 Ok(resp)
             }
@@ -167,7 +167,7 @@ impl FromLuaExact for OnAcceptRedirectResp {
     }
 }
 
-create_union_mlua!(pub enum OnAcceptResp = OnAcceptExpectHttpResp | OnAcceptDenyResp | OnAcceptRedirectResp);
+create_union_mlua!(pub enum OnAcceptResp = OnAcceptDenyResp | OnAcceptRedirectResp | OnAcceptExpectHttpResp);
 
 
 impl std::fmt::Debug for OnAcceptResp {
@@ -289,7 +289,7 @@ pub struct OnRequestExpectHttpBodyResp {
 impl FromLuaExact for OnRequestExpectHttpBodyResp {
     fn from_lua_exact(lua_value: LuaValue, _: &Lua) -> mlua::Result<Self> {
         match lua_value {
-            LuaValue::UserData(ud) => {
+            LuaValue::UserData(ud) if ud.is::<Self>() => {
                 let resp: OnRequestExpectHttpBodyResp = ud.take::<Self>()?;
                 Ok(resp)
             }
@@ -550,7 +550,6 @@ use super::*;
 
             proxy:on_accept(function(client)
                 print("Accepted connection from", client.ip, client.port)
-
                 if client.ip == "10.100.1.1" then
                     local resp = proxy:resp_expect_http()
                     resp:set_max_header_size(16384)

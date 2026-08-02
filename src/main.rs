@@ -147,10 +147,7 @@ async fn resolve_backend<'a>(
         },
     ).unwrap();
 
-    // if any hook cache is found expired, we will invalidate all hooks after it for this request since they might depend on it
-    let mut call_hook = |h: &mut Hook, invalidated: bool| {
-        let mut newly_called = invalidated;
-
+    let mut call_hook = |h: &mut Hook| {
         let cache_key = if let Some(ref k) = h.cache_key_kind {
             Some(match k {
                 HookCacheKeyKind::Url=> req.0.path.clone(),
@@ -161,7 +158,7 @@ async fn resolve_backend<'a>(
         } else {
             None
         };
-        let cached_result = if !invalidated && let Some(ref k) = cache_key {
+        let cached_result = if let Some(ref k) = cache_key {
             h.cached_result.get(k)
         } else {
             None
@@ -181,7 +178,6 @@ async fn resolve_backend<'a>(
                     let resp = f.call::<HookResult>((&client, &req)).unwrap();
                     Ok(resp)
                 }).unwrap();
-                newly_called = true;
 
                 if let Some(t) = h.cache_ttl {
                     h.cached_result.insert(cache_key.unwrap().clone(), CachedValue::new(resp.clone(), t));
@@ -199,13 +195,11 @@ async fn resolve_backend<'a>(
                 }
             }
         }
-        newly_called
     };
 
-    let mut invalidated = false;
     if let Some(h) = host_hooks {
         for h_t in h.borrow_mut().iter_mut() {
-            invalidated = call_hook(h_t, invalidated);
+            call_hook(h_t); // hooks are independent right now
         }
     }
 
