@@ -148,6 +148,17 @@ impl ProxyModuleTable {
 
                     lua.globals().set("require", require);
 
+                    // async primitive that yields: `conduit.sleep(ms)`
+                    let conduit = lua.create_table().unwrap();
+                    let sleep = lua
+                        .create_async_function(|_, ms: u64| async move {
+                            monoio::time::sleep(Duration::from_millis(ms)).await;
+                            Ok(())
+                        })
+                        .unwrap();
+                    conduit.set("sleep", sleep).unwrap();
+                    lua.globals().set("conduit", conduit).unwrap();
+
                     let module = Rc::new(ProxyModule::new(lua.clone()));
                     let module_ud = lua.create_userdata(Module(module.clone())).unwrap();
                     lua.globals().set(module_name.clone(), module_ud).unwrap();
