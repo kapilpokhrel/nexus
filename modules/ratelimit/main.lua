@@ -1,7 +1,7 @@
 -- https://redis.io/tutorials/howtos/ratelimiting
 local redis = require("redis")
 
-local MAX_REQUESTS = 10000
+local MAX_REQUESTS = 5000
 local WINDOW_SECONDS = 1
 
 local LUA_SCRIPT = [[

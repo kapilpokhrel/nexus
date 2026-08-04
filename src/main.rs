@@ -107,6 +107,7 @@ async fn resolve_backend<'a>(
     hooks: Rc<RefCell<HashMap<Box<str>, RefCell<Vec<Hook>>>>>,
     module_table: Rc<ProxyModuleTable>,
 ) -> io::Result<(String, Option<Vec<(String, String)>>)> {
+    // return Ok(("127.0.0.1:8000".into(), None));
     // hook call can now yield (call_async), so no borrow may be held across an await.
     // so we just snapshot the hook info for all the hooks for this host, and then iterate over that snapshot, reading/writing the cache as needed.
     struct HookSnapshot {
