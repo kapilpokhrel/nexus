@@ -264,6 +264,26 @@ async fn resolve_backend<'a>(
     handle_resp(&resp)
 }
 
+fn enable_defer_accept(listener: &TcpListener, timeout: Duration) -> io::Result<()> {
+    let fd = listener.as_raw_fd();
+    let seconds = timeout.as_secs() as libc::c_int;
+
+    unsafe {
+        let ret = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_DEFER_ACCEPT,
+            &seconds as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+
+        if ret == -1 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 #[allow(unused_variables)]
 #[monoio::main(threads = 8, timer_enabled = true)]
 async fn main() {
@@ -308,6 +328,7 @@ async fn main() {
     let host: String = lua.globals().get::<LuaAnyUserData>("proxy").unwrap().borrow::<Proxy>().unwrap().listen_addr.as_ref().into();
     println!("{}", host);
     let listener = TcpListener::bind(host).unwrap();
+    enable_defer_accept(&listener, Duration::from_secs(1)).unwrap();
 
     loop {
         let Ok((stream, _)) = listener.accept().await else {
