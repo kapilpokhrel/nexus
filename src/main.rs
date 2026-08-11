@@ -5,7 +5,7 @@ use crate::lua_config::{CachedValue, Client, Context, HeadersPatchBlock, Hook, H
 use crate::lua_module::{HookResult, ProxyModule, ProxyModuleTable};
 use mlua::prelude::*;
 use monoio::buf::{IoBuf, IoBufMut};
-use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
+use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
 use monoio::net::{TcpListener, TcpStream};
 use tealr::TypeWalker;
 use std::cell::RefCell;
@@ -14,6 +14,7 @@ use std::fs;
 use std::io;
 use std::mem::MaybeUninit;
 use std::ops::Range;
+use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -40,17 +41,42 @@ thread_local! {
     static CONN_POOL: RefCell<HashMap<String, VecDeque<TcpStream>>> = RefCell::new(HashMap::new());
 }
 
+fn is_stream_alive(stream: &TcpStream) -> bool {
+    let fd = stream.as_raw_fd();
+    let mut buf = [0u8; 1];
+
+    // MSG_PEEK: inspect buffer without pulling data out.
+    // MSG_DONTWAIT: instantly return if no data exists instead of waiting.
+    let res = unsafe {
+        libc::recv(
+            fd,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+
+    if res > 0 {
+        true
+    } else if res == 0 {
+        false
+    } else {
+        let err = io::Error::last_os_error();
+        matches!(err.kind(), io::ErrorKind::WouldBlock)
+    }
+}
+
 async fn get_conn(backend_addr: &String) -> io::Result<TcpStream> {
     let s = CONN_POOL.with(|p| {
         p.borrow_mut().get_mut(backend_addr).and_then(|v| v.pop_back())
     });
-    let stream = match s {
-        Some(stream) => {
+    let stream = if let Some(stream) = s && is_stream_alive(&stream){
            stream
-        }
-        None => TcpStream::connect(backend_addr).await?
+    } else {
+        let s = TcpStream::connect(backend_addr).await?;
+        let _ = s.set_nodelay(true);
+        s
     };
-    let _ = stream.set_nodelay(true);
     Ok(stream)
 }
 
@@ -321,7 +347,7 @@ async fn forward_http(
 
     let in_buf = read_len.saturating_sub(head.header_offset);
     let buf = if let Some(n) = head.content_len {
-        let buf = fwd_or_reconnect(buf, &mut backend, head.header_offset + in_buf.min(n)).await?;
+        let buf = fwd(buf, &mut backend, head.header_offset + in_buf.min(n), 0).await?;
         send_n(buf, &mut client, &mut backend, n.saturating_sub(in_buf)).await?
     } else if head.chunked {
         return Err(io::Error::new(
@@ -329,25 +355,33 @@ async fn forward_http(
             "we don't handle chunked yet",
         ));
     } else {
-        let buf = fwd_or_reconnect(buf, &mut backend, head.start_of_header).await?;
+        //let buf = fwd(buf, &mut backend, head.start_of_header, 0).await?;
+        let mut temp_buf: Vec<u8> = Vec::with_capacity(256 + head.header_offset);
+        temp_buf.extend_from_slice(&buf[0..head.start_of_header]);
         if let Some(headers) = header_add_vec {
             for (k, v) in headers {
                 let line = format!("{k}: {v}\r\n").into_bytes();
-                backend.write_all(line).await;
+                temp_buf.extend_from_slice(&line);
             }
         }
-        fwd(buf, &mut backend, head.header_offset.saturating_sub(head.start_of_header), head.start_of_header).await?
+        temp_buf.extend_from_slice(&buf[head.start_of_header..head.header_offset]);
+        let (res, _) = backend.write_all(temp_buf).await;
+        res?;
+        buf
     };
 
     // response
     let (buf, head, _req_line, read_len) = read_headers(buf, &mut backend, &mut hdr_buf).await?;
 
-    let in_buf = read_len.saturating_sub(head.header_offset);
     if let Some(n) = head.content_len {
-        let buf = fwd(buf, &mut client, head.start_of_header, 0).await?;
-        client.write_all("Connection: Close\r\n").await;
-        let buf = fwd(buf, &mut client, head.header_offset.saturating_sub(head.start_of_header), head.start_of_header).await?;
-        let buf = fwd(buf, &mut client, in_buf.min(n), head.header_offset).await?;
+        let mut temp_buf: Vec<u8> = Vec::with_capacity(256 + read_len);
+        temp_buf.extend_from_slice(&buf[0..head.start_of_header]);
+        temp_buf.extend_from_slice(b"Connection: Close\r\n");
+        temp_buf.extend_from_slice(&buf[head.start_of_header..]);
+        let (res, _) = client.write_all(temp_buf).await;
+        res?;
+
+        let in_buf = read_len.saturating_sub(head.header_offset);
         let _ = send_n(buf, &mut backend, &mut client, n.saturating_sub(in_buf)).await?;
     } else if head.chunked {
         return Err(io::Error::new(
@@ -488,22 +522,6 @@ async fn read_headers(
                 continue;
             }
             Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
-        }
-    }
-}
-
-async fn fwd_or_reconnect(mut buf: Vec<u8>, dst: &mut TcpStream, n: usize) -> io::Result<Vec<u8>> {
-    let (res, view) = dst.write_all(buf.slice(..n)).await;
-    buf = view.into_inner();
-    match res {
-        Ok(_) => Ok(buf),
-        Err(_) => {
-            let addr = dst.local_addr()?;
-            let new_dst = TcpStream::connect(addr).await?;
-            let _old = std::mem::replace(dst, new_dst);
-            let (res, view) = dst.write_all(buf.slice(..n)).await;
-            res?;
-            Ok(view.into_inner())
         }
     }
 }
