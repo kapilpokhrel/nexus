@@ -1,4 +1,5 @@
 use mlua::prelude::*;
+use crate::lua_config::ConfHandlePool;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -55,16 +56,21 @@ impl FromLua for HookResult {
     }
 }
 
+pub const HOOK_POOL_SIZE: usize = 8;
+
 pub struct ProxyModule {
     pub hook_handler: RefCell<Option<LuaFunction>>,
     pub lua: Lua,
+    pub pool: ConfHandlePool,
 }
 
 impl ProxyModule {
     pub fn new(lua: Lua) -> Self {
+        let pool = ConfHandlePool::new(lua.clone(), HOOK_POOL_SIZE);
         ProxyModule {
             hook_handler: RefCell::new(None),
-            lua
+            lua,
+            pool,
         }
     }
 }
@@ -196,16 +202,15 @@ use super::*;
 
         let client = Client::new("127.0.0.1", 6969);
         for (name, module) in module_table.modules {
-            let _ = module.lua.scope(|scope| {
-                if let Some(f) = &*module.hook_handler.borrow() {
-                    let req = scope.create_userdata(req.clone())?;
-                    let client = scope.create_userdata(client.clone())?;
-                    let context = scope.create_userdata(ctx.clone())?;
-                    let x = f.call::<HookResult>((client, req, context));
-                    println!("{:?}, {:?}", name, x);
-                }
-                Ok(())
-            });
+            let f = module.hook_handler.borrow().as_ref().cloned();
+            if let Some(f) = f {
+                let h = module.pool.checkout();
+                h.set_client(client.clone());
+                h.set_req(req.clone());
+                h.set_ctx(ctx.clone());
+                let x = f.call::<HookResult>((&h.client_ud, &h.req_ud, &h.ctx_ud));
+                println!("{:?}, {:?}", name, x);
+            }
         }
         Ok(())
     }

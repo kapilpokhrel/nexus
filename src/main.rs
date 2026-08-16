@@ -1,7 +1,7 @@
 mod lua_config;
 mod lua_module;
 
-use crate::lua_config::{CachedValue, Client, Context, HeadersPatchBlock, Hook, HookCacheKeyKind, OnAcceptDenyResp, OnAcceptExpectHttpResp, OnAcceptFn, OnAcceptRedirectResp, OnAcceptResp, OnRequestExpectHttpBodyResp, OnRequestResp, Proxy, Request};
+use crate::lua_config::{CachedValue, Client, ClientHandle, Context, ContextHandle, HeadersPatchBlock, Hook, HookCacheKeyKind, LuaState, OnAcceptDenyResp, OnAcceptExpectHttpResp, OnAcceptFn, OnAcceptRedirectResp, OnAcceptResp, OnRequestExpectHttpBodyResp, OnRequestResp, Proxy, Request, RequestHandle};
 use crate::lua_module::{HookResult, ProxyModule, ProxyModuleTable};
 use mlua::prelude::*;
 use monoio::buf::{IoBuf, IoBufMut};
@@ -18,6 +18,8 @@ use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+
+pub const CONF_POOL_SIZE: usize = 8;
 
 #[derive(Debug)]
 struct HttpHead {
@@ -128,11 +130,10 @@ async fn resolve_backend<'a>(
     client: Client,
     req: Request,
     mut context: Context,
-    lua: Lua,
-    handlers: Rc<RefCell<HashMap<Box<str>, LuaFunction>>>,
-    hooks: Rc<RefCell<HashMap<Box<str>, RefCell<Vec<Hook>>>>>,
-    module_table: Rc<ProxyModuleTable>,
+    state: &LuaState,
+    module_table: &ProxyModuleTable,
 ) -> io::Result<(String, Option<Vec<(String, String)>>)> {
+    let hooks = &state.hooks;
     // return Ok(("127.0.0.1:8000".into(), None));
     // hook call can now yield (call_async), so no borrow may be held across an await.
     // so we just snapshot the hook info for all the hooks for this host, and then iterate over that snapshot, reading/writing the cache as needed.
@@ -183,12 +184,14 @@ async fn resolve_backend<'a>(
             let module = module_table.modules.get(&ss.name).unwrap().clone();
             let f = module.hook_handler.borrow().as_ref().cloned();
             if let Some(f) = f {
-                let client_ud = module.lua.create_userdata(client.clone()).unwrap();
-                let req_ud = module.lua.create_userdata(req.clone()).unwrap();
+                let h = module.pool.checkout();
+                h.set_client(client.clone());
+                h.set_req(req.clone());
 
                 // yields here if the module awaits (e.g. conduit.sleep), letting
-                // other requests on this thread run
-                let r = f.call_async::<HookResult>((client_ud, req_ud)).await.unwrap();
+                // other requests on this thread run. `h` is held across the await,
+                // so this request keeps its own pool entry while suspended.
+                let r = f.call_async::<HookResult>((&h.client_ud, &h.req_ud)).await.unwrap();
 
                 if let (Some(t), Some(k)) = (ss.ttl, ss.key.as_ref()) {
                     let map = hooks.borrow();
@@ -205,27 +208,25 @@ async fn resolve_backend<'a>(
 
         if let Some(HookResult::ContinueWithCtx(update_ctx)) = resp {
             for (key, val) in update_ctx.updates.iter() {
-                if let Ok(v) = transfer_value_between_states(val.clone(), &lua) {
+                if let Ok(v) = transfer_value_between_states(val.clone(), &state.lua) {
                     context.insert(key.clone(), v);
                 }
             }
         }
     }
 
-    let handler_fn = handlers.borrow();
+    let handler_fn = state.req_handlers.borrow();
     let lua_fn = handler_fn.get(host).unwrap();
 
     let call_lua_fn = || {
-        lua.scope(|scope| {
-            // benchmark shows that adding creating lua userdata takes significant time (cpu time)
-            // but it seems we aren't helt back by cpu
-            let req = scope.create_userdata(req).unwrap();
-            let client = scope.create_userdata(client.clone()).unwrap();
-            let context_ud = scope.create_userdata(context)?;
+        let h = state.pool.checkout();
+        h.set_client(client.clone());
+        h.set_req(req.clone());
+        h.set_ctx(context.clone());
 
-            lua_fn
-                .call::<OnRequestResp>((client, req, context_ud))
-        }).unwrap()
+        lua_fn
+            .call::<OnRequestResp>((&h.client_ud, &h.req_ud, &h.ctx_ud))
+            .unwrap()
     };
 
     let handle_resp = |resp: &OnRequestResp| {
@@ -244,7 +245,7 @@ async fn resolve_backend<'a>(
         }
     };
 
-    lua.set_hook(
+    state.lua.set_hook(
         LuaHookTriggers {
             every_line: false,
             on_calls: false,
@@ -260,7 +261,7 @@ async fn resolve_backend<'a>(
     ).unwrap();
 
     let resp = call_lua_fn();
-    lua.remove_hook();
+    state.lua.remove_hook();
     handle_resp(&resp)
 }
 
@@ -289,9 +290,9 @@ fn enable_defer_accept(listener: &TcpListener, timeout: Duration) -> io::Result<
 async fn main() {
     let types = TypeWalker::new()
         .process_type::<Proxy>()
-        .process_type::<Client>()
-        .process_type::<Request>()
-        .process_type::<Context>()
+        .process_type::<ClientHandle>()
+        .process_type::<RequestHandle>()
+        .process_type::<ContextHandle>()
         .process_type::<OnAcceptExpectHttpResp>()
         .process_type::<OnAcceptDenyResp>()
         .process_type::<OnAcceptRedirectResp>()
@@ -301,31 +302,18 @@ async fn main() {
     fs::write("conduit.json", json);
 
     let conf_source = fs::read("config.lua").unwrap();
-    // lua setup
-
-    let lua = Lua::new();
 
     let module_table = Rc::new(ProxyModuleTable::new());
+    let state = Rc::new(LuaState::new(CONF_POOL_SIZE).unwrap());
 
-    let req_handlers: Rc<RefCell<HashMap<Box<str>,LuaFunction>>> =
-        Rc::new(RefCell::new(HashMap::new()));
+    // reusing handles means lua allocates so little that the default incremental
+    // GC stops keeping up; generational collects it at no measurable cost
+    state.lua.gc_gen(20, 100);
 
-    let hooks: Rc<RefCell<HashMap<Box<str>, RefCell<Vec<Hook>>>>> = Rc::new(RefCell::new(HashMap::new()));
-
-    let proxy = Proxy {
-        on_accept_fn: Rc::new(RefCell::new(None)),
-        req_handlers: req_handlers.clone(),
-        listen_addr: "".into(),
-        hooks: hooks.clone()
-    };
-
-    let proxy_ud = lua.create_userdata(proxy).unwrap();
-    lua.globals().set("proxy", proxy_ud).unwrap();
-
-    let source = lua.load(str::from_utf8(&conf_source).unwrap());
+    let source = state.lua.load(str::from_utf8(&conf_source).unwrap());
     source.exec().unwrap();
 
-    let host: String = lua.globals().get::<LuaAnyUserData>("proxy").unwrap().borrow::<Proxy>().unwrap().listen_addr.as_ref().into();
+    let host: String = state.lua.globals().get::<LuaAnyUserData>("proxy").unwrap().borrow::<Proxy>().unwrap().listen_addr.as_ref().into();
     println!("{}", host);
     let listener = TcpListener::bind(host).unwrap();
     enable_defer_accept(&listener, Duration::from_secs(1)).unwrap();
@@ -334,21 +322,17 @@ async fn main() {
         let Ok((stream, _)) = listener.accept().await else {
             continue;
         };
-        let lua_pass = lua.clone();
-        let handlers_pass = req_handlers.clone();
+        let state_pass = state.clone();
         let module_table_pass = module_table.clone();
-        let hooks_pass = hooks.clone();
         monoio::spawn(async move {
-            let _r = forward_http(stream, lua_pass, handlers_pass, hooks_pass, module_table_pass).await;
+            let _r = forward_http(stream, state_pass, module_table_pass).await;
         });
     }
 }
 
 async fn forward_http(
     mut client: TcpStream,
-    lua: Lua,
-    handlers: Rc<RefCell<HashMap<Box<str>, LuaFunction>>>,
-    hooks: Rc<RefCell<HashMap<Box<str>, RefCell<Vec<Hook>>>>>,
+    state: Rc<LuaState>,
     module_table: Rc<ProxyModuleTable>
 ) -> io::Result<()> {
     let buf = vec![0u8; 8 * 1024];
@@ -362,7 +346,8 @@ async fn forward_http(
     let context = Context::new();
 
     let (host, req) = get_host_requset(&buf, &hdr_buf, &head, &req_line);
-    let (backend_addr, header_add_vec) = resolve_backend(host, client_t, req, context, lua, handlers, hooks, module_table).await?;
+    let (backend_addr, header_add_vec) =
+        resolve_backend(host, client_t, req, context, &state, &module_table).await?;
 
     let mut backend = get_conn(&backend_addr).await?;
 

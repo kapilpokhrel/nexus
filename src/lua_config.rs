@@ -1,6 +1,5 @@
 use mlua::prelude::*;
 use tealr::mlu::{FromLuaExact, FromToLua, TealData, TealDataMethods, TypedFunction};
-use toml::de;
 use std::{cell::RefCell, fmt::Debug};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -10,12 +9,100 @@ use tealr::{ToTypename, create_union_mlua};
 
 use crate::lua_module::HookResult;
 
+#[derive(Clone)]
+pub struct OnRequestParamSlot {
+    pub client: Option<Client>,
+    pub req: Option<Request>,
+    pub ctx: Option<Context>
+}
+
+macro_rules! teal_name {
+    ($t:ty, $n:literal) => {
+        impl ToTypename for $t {
+            fn to_typename() -> tealr::Type {
+                tealr::Type::new_single($n, tealr::KindOfType::External)
+            }
+        }
+    };
+}
+
+pub struct OnRequestHandleUDs {
+    slot: Rc<RefCell<OnRequestParamSlot>>,
+    pub client_ud: LuaAnyUserData,
+    pub req_ud: LuaAnyUserData,
+    pub ctx_ud: LuaAnyUserData,
+}
+
+impl OnRequestHandleUDs {
+    pub fn new(lua: &Lua, slot: Rc<RefCell<OnRequestParamSlot>>) -> Self {
+        let client_ud = lua.create_userdata(ClientHandle(slot.clone())).unwrap();
+        let req_ud = lua.create_userdata(RequestHandle(slot.clone())).unwrap();
+        let ctx_ud = lua.create_userdata(ContextHandle(slot.clone())).unwrap();
+        Self {
+            slot,
+            client_ud,
+            req_ud,
+            ctx_ud,
+        }
+    }
+
+    pub fn set_client(&self, client: Client) {
+        self.slot.borrow_mut().client = Some(client);
+    }
+
+    pub fn set_req(&self, req: Request) {
+        self.slot.borrow_mut().req = Some(req);
+    }
+
+    pub fn set_ctx(&self, ctx: Context) {
+        self.slot.borrow_mut().ctx = Some(ctx);
+    }
+
+    pub fn clear(&self) {
+        self.slot.borrow_mut().client = None;
+        self.slot.borrow_mut().req = None;
+        self.slot.borrow_mut().ctx = None;
+    }
+}
+
+pub struct ConfHandlePool {
+    lua: Lua,
+    pool: Vec<Rc<OnRequestHandleUDs>>,
+}
+
+impl ConfHandlePool {
+    pub fn new(lua: Lua, pool_size: usize) -> Self {
+        let mut pool = Vec::with_capacity(pool_size);
+        for _ in 0..pool_size {
+            let slot = Rc::new(RefCell::new(OnRequestParamSlot { client: None, req: None, ctx: None }));
+            pool.push(Rc::new(OnRequestHandleUDs::new(&lua, slot)));
+        }
+        Self { lua, pool }
+    }
+
+    pub fn checkout(&self) -> Rc<OnRequestHandleUDs> {
+        for uds in &self.pool {
+            if Rc::strong_count(uds) == 1 {
+                uds.clear();
+                return uds.clone();
+            }
+        }
+        //no free entry: this request gets its own, which is dropped rather than pooled
+        let slot = Rc::new(RefCell::new(OnRequestParamSlot { client: None, req: None, ctx: None }));
+        Rc::new(OnRequestHandleUDs::new(&self.lua, slot))
+    }
+
+    pub fn free_count(&self) -> usize {
+        self.pool.iter().filter(|u| Rc::strong_count(u) == 1).count()
+    }
+}
+
 pub struct ClientInner {
     pub ip: String,
     pub port: u16
 }
 
-#[derive(Clone, tealr::mlu::UserData, ToTypename)]
+#[derive(Clone)]
 pub struct Client(pub Arc<ClientInner>);
 
 impl Client {
@@ -27,15 +114,14 @@ impl Client {
     }
 }
 
-fn ip_location(ip: impl Into<String>) -> String {
-    "XX".to_string()
-}
+#[derive(tealr::mlu::UserData)]
+pub struct ClientHandle (pub Rc<RefCell<OnRequestParamSlot>>);
+teal_name!(ClientHandle, "Client");
 
-impl tealr::mlu::TealData for Client {
+impl tealr::mlu::TealData for ClientHandle {
     fn add_fields<F: tealr::mlu::TealDataFields<Self>>(fields: &mut F) {
-        fields.add_field_method_get("ip", |lua, this| lua.create_string(this.0.ip.as_str()));
-        fields.add_field_method_get("port", |_, this| Ok(this.0.port));
-        fields.add_field_function_get("geo", |lua, this| lua.create_string(ip_location(&this.borrow::<Client>().unwrap().0.ip).as_str()));
+        fields.add_field_method_get("ip", |lua, this| lua.create_string(this.0.borrow().client.as_ref().unwrap().0.ip.as_str()));
+        fields.add_field_method_get("port", |_, this| Ok(this.0.borrow().client.as_ref().unwrap().0.port));
     }
 }
 
@@ -187,7 +273,7 @@ pub struct ContextInner {
     pub ctx: HashMap<Box<str>, X>
 }
 
-#[derive(Clone, Debug, tealr::mlu::UserData, ToTypename)]
+#[derive(Clone, Debug)]
 pub struct Context(Arc<RefCell<ContextInner>>);
 
 impl Context {
@@ -205,10 +291,14 @@ impl Context {
     }
 }
 
-impl tealr::mlu::TealData for Context {
+#[derive(tealr::mlu::UserData)]
+pub struct ContextHandle (pub Rc<RefCell<OnRequestParamSlot>>);
+teal_name!(ContextHandle, "Context");
+
+impl tealr::mlu::TealData for ContextHandle {
     fn add_methods<M: TealDataMethods<Self>>(methods: &mut M) {
         methods.add_method("get", |_, this, key: String| {
-            if let Some(v) = this.0.borrow().ctx.get::<Box<str>>(&key.into()) {
+            if let Some(v) = this.0.borrow().ctx.as_ref().unwrap().0.borrow().ctx.get::<Box<str>>(&key.into()) {
                 Ok(Some(v.clone()))
             } else {
                 Ok(None)
@@ -225,7 +315,7 @@ pub struct RequestInner {
     pub headers: HashMap<String, String>
 }
 
-#[derive(Clone, Debug, tealr::mlu::UserData, ToTypename)]
+#[derive(Clone, Debug)]
 pub struct Request(pub Arc<RequestInner>);
 
 impl Request {
@@ -238,13 +328,17 @@ impl Request {
     }
 }
 
-impl tealr::mlu::TealData for Request {
+#[derive(tealr::mlu::UserData)]
+pub struct RequestHandle (pub Rc<RefCell<OnRequestParamSlot>>);
+teal_name!(RequestHandle, "Request");
+
+impl tealr::mlu::TealData for RequestHandle {
     fn add_fields<F: tealr::mlu::TealDataFields<Self>>(fields: &mut F) {
-        fields.add_field_method_get("method", |lua, this| lua.create_string(&this.0.method));
-        fields.add_field_method_get("path", |lua, this| lua.create_string(&this.0.path));
+        fields.add_field_method_get("method", |lua, this| lua.create_string(&this.0.borrow().req.as_ref().unwrap().0.method));
+        fields.add_field_method_get("path", |lua, this| lua.create_string(&this.0.borrow().req.as_ref().unwrap().0.path));
         fields.add_field_method_get("headers", |lua, this| {
             let table = lua.create_table()?;
-            for (k, v) in this.0.headers.iter() {
+            for (k, v) in this.0.borrow().req.as_ref().unwrap().0.headers.iter() {
                 table.set(k.clone(), v.clone())?;
             }
             Ok(table)
@@ -252,7 +346,7 @@ impl tealr::mlu::TealData for Request {
     }
     fn add_methods<M: TealDataMethods<Self>>(methods: &mut M) {
         methods.add_method("header", |lua, this, h: String| {
-            if let Some(v) = this.0.headers.get(&h) {
+            if let Some(v) = this.0.borrow().req.as_ref().unwrap().0.headers.get(&h) {
                 Ok(Some(v.to_string()))
             } else {
                 Ok(None)
@@ -359,8 +453,8 @@ impl std::fmt::Debug for OnRequestResp {
     }
 }
 
-pub type OnAcceptFn = TypedFunction<Client, OnAcceptResp>;
-pub type OnRequestFn = TypedFunction<(Client, Request, Context), OnRequestResp>;
+pub type OnAcceptFn = TypedFunction<ClientHandle, OnAcceptResp>;
+pub type OnRequestFn = TypedFunction<(ClientHandle, RequestHandle, ContextHandle), OnRequestResp>;
 
 #[derive(Debug)]
 pub struct CachedValue<T> {
@@ -507,6 +601,46 @@ impl TealData for Proxy {
     }
 }
 
+type HandlerMap = Rc<RefCell<HashMap<Box<str>, LuaFunction>>>;
+type OnAcceptFnType = Rc<RefCell<Option<LuaFunction>>>;
+type HooksMap = Rc<RefCell<HashMap<Box<str>, RefCell<Vec<Hook>>>>>;
+
+pub struct LuaState {
+    pub lua: Lua,
+    pub req_handlers: HandlerMap,
+    pub on_accept_fn: OnAcceptFnType,
+    pub hooks: HooksMap,
+    pub pool: ConfHandlePool,
+}
+
+impl LuaState {
+    pub fn new(pool_size: usize) -> Result<Self, LuaError> {
+        let req_handlers: Rc<RefCell<HashMap<Box<str>, LuaFunction>>> = Rc::new(RefCell::new(HashMap::new()));
+        let on_accept_fn: Rc<RefCell<Option<LuaFunction>>> = Rc::new(RefCell::new(None));
+        let hooks: Rc<RefCell<HashMap<Box<str>, RefCell<Vec<Hook>>>>> = Rc::new(RefCell::new(HashMap::new()));
+
+        let proxy = Proxy{
+            req_handlers: req_handlers.clone(),
+            on_accept_fn: on_accept_fn.clone(),
+            listen_addr: "".into(),
+            hooks: hooks.clone()
+        };
+        let lua = Lua::new();
+
+        let proxy_ud = lua.create_userdata(proxy).unwrap();
+        lua.globals().set("proxy", proxy_ud)?;
+
+        let handles_pool = ConfHandlePool::new(lua.clone(), pool_size);
+
+        Ok(LuaState {
+            lua,
+            req_handlers,
+            on_accept_fn,
+            hooks,
+            pool: handles_pool })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -521,22 +655,9 @@ use super::*;
 
         let req = Request::new("GET", "path", headers);
 
-        let req_handlers: Rc<RefCell<HashMap<Box<str>, LuaFunction>>> = Rc::new(RefCell::new(HashMap::new()));
-        let on_accept_fn: Rc<RefCell<Option<LuaFunction>>> = Rc::new(RefCell::new(None));
-        let hooks: Rc<RefCell<HashMap<Box<str>, RefCell<Vec<Hook>>>>> = Rc::new(RefCell::new(HashMap::new()));
+        let lua_state = LuaState::new(1)?;
 
-        let proxy = Proxy{
-            req_handlers: req_handlers.clone(),
-            on_accept_fn: on_accept_fn.clone(),
-            listen_addr: "".into(),
-            hooks
-        };
-        let lua = Lua::new();
-
-        let proxy_ud = lua.create_userdata(proxy).unwrap();
-        lua.globals().set("proxy", proxy_ud)?;
-
-        let source = lua.load(
+        let source = lua_state.lua.load(
             r#"
 
 
@@ -573,38 +694,34 @@ use super::*;
         let client1 = Client::new("127.0.0.1", 6969);
         let client2 = Client::new("10.100.1.1", 6969);
         let client3 = Client::new("192.168.1.1", 6969);
-        lua.scope(|scope| {
-            let client1 = scope.create_userdata(client1.clone());
-            let client2 = scope.create_userdata(client2);
-            let client3 = scope.create_userdata(client3);
 
-            let resp = on_accept_fn.borrow().as_ref().unwrap().call::<OnAcceptResp>(client1)?;
-            println!("{:?}", resp);
+        let handle_ud = lua_state.pool.checkout();
+        handle_ud.set_client(client1.clone());
+        let resp = lua_state.on_accept_fn.borrow().as_ref().unwrap().call::<OnAcceptResp>(&handle_ud.client_ud)?;
+        println!("{:?}", resp);
 
-            let resp = on_accept_fn.borrow().as_ref().unwrap().call::<OnAcceptResp>(client2)?;
-            println!("{:?}", resp);
+        handle_ud.set_client(client2.clone());
+        let resp = lua_state.on_accept_fn.borrow().as_ref().unwrap().call::<OnAcceptResp>(&handle_ud.client_ud)?;
+        println!("{:?}", resp);
 
-            let resp = on_accept_fn.borrow().as_ref().unwrap().call::<OnAcceptResp>(client3)?;
-            println!("{:?}", resp);
-            Ok(())
-        })?;
+        handle_ud.set_client(client3.clone());
+        let resp = lua_state.on_accept_fn.borrow().as_ref().unwrap().call::<OnAcceptResp>(&handle_ud.client_ud)?;
+        println!("{:?}", resp);
 
         println!();
 
         let ctx = Context::new();
-        lua.scope(|scope| {
-            let req = scope.create_userdata(req)?;
-            let client = scope.create_userdata(client1)?;
-            let context = scope.create_userdata(ctx)?;
+        handle_ud.set_client(client1.clone());
+        handle_ud.set_req(req.clone());
+        handle_ud.set_ctx(ctx.clone());
 
-            let resp = req_handlers
-                .borrow()
-                .get("example.com")
-                .unwrap()
-                .call::<OnRequestResp>((client, req, context));
-            println!("{:?}", resp);
-            Ok(())
-        })?;
+        let resp = lua_state.req_handlers
+            .borrow()
+            .get("example.com")
+            .unwrap()
+            .call::<OnRequestResp>((&handle_ud.client_ud, &handle_ud.req_ud, &handle_ud.ctx_ud));
+        println!("{:?}", resp);
+
         Ok(())
     }
 }
