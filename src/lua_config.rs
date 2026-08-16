@@ -490,9 +490,30 @@ pub enum HookCacheKeyKind {
 #[derive(Debug)]
 pub struct Hook {
     pub name: String,
-    pub cache_ttl: Option<Duration>,
-    pub cache_key_kind: Option<HookCacheKeyKind>,
+    pub cacheability: Option<Cacheability>,
     pub cached_result: HashMap<String, CachedValue<HookResult>>,
+}
+
+#[derive(Debug, tealr::mlu::UserData, ToTypename)]
+pub struct Cacheability {
+    pub ttl: Duration,
+    pub key: HookCacheKeyKind
+}
+impl TealData for Cacheability {}
+impl FromLua for Cacheability {
+    fn from_lua(lua_value: LuaValue, _: &Lua) -> LuaResult<Self> {
+        match lua_value {
+            LuaValue::UserData(ud) if ud.is::<Self>() => {
+                let resp: Cacheability = ud.take::<Self>()?;
+                Ok(resp)
+            }
+            _ => Err(LuaError::FromLuaConversionError {
+                from: lua_value.type_name(),
+                to: "Cacheability".to_string(),
+                message: Some("Expected a userdata".to_string()),
+            }),
+        }
+    }
 }
 
 #[derive(Debug, tealr::mlu::UserData, ToTypename)]
@@ -510,38 +531,31 @@ impl TealData for Proxy {
             Ok(())
         });
 
-        // will introduce a new cache type
-        methods.add_method_mut("register_hook", |_, this, (host, module_name, cache_ttl, cache_key): (String, String, usize, Option<String>)| {
+        methods.add_method_mut("cacheability", |_, this, (cache_ttl, cache_key): (u64, String)| {
+            let key = if cache_key == "$url" {
+                HookCacheKeyKind::Url
+            } else if cache_key == "$ip" {
+                HookCacheKeyKind::Ip
+            } else if cache_key.starts_with("$header:") {
+                let header_name = cache_key.trim_start_matches("$header:").to_string();
+                HookCacheKeyKind::Header(header_name)
+            } else {
+                HookCacheKeyKind::Custom(cache_key)
+            };
+            Ok(Cacheability {
+                ttl: Duration::from_secs(cache_ttl),
+                key
+            })
+        });
+
+        methods.add_method_mut("register_hook", |_, this, (host, module_name, cache_info): (String, String, Option<Cacheability>)| {
             let key: Box<str> = host.into();
             if !this.hooks.borrow().contains_key(&key) {
                 this.hooks.borrow_mut().insert(key.clone(), RefCell::new(Vec::new()));
             }
-            let cache_ttl = if cache_ttl == 0 {
-                None
-            } else {
-                Some(Duration::from_secs(cache_ttl as u64))
-            };
-
-            let cache_key_kind = match cache_key {
-                Some(k) => {
-                    if k == "$url" {
-                        Some(HookCacheKeyKind::Url)
-                    } else if k == "$ip" {
-                        Some(HookCacheKeyKind::Ip)
-                    } else if k.starts_with("$header:") {
-                        let header_name = k.trim_start_matches("$header:").to_string();
-                        Some(HookCacheKeyKind::Header(header_name))
-                    } else {
-                        Some(HookCacheKeyKind::Custom(k))
-                    }
-                }
-                None => None,
-            };
-
             let hook = Hook {
                 name: module_name,
-                cache_ttl,
-                cache_key_kind,
+                cacheability: cache_info,
                 cached_result: HashMap::new(),
             };
             this.hooks.borrow().get(&key).unwrap().borrow_mut().insert(0, hook);

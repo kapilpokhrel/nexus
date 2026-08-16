@@ -1,7 +1,7 @@
 mod lua_config;
 mod lua_module;
 
-use crate::lua_config::{CachedValue, Client, ClientHandle, Context, ContextHandle, HeadersPatchBlock, Hook, HookCacheKeyKind, LuaState, OnAcceptDenyResp, OnAcceptExpectHttpResp, OnAcceptFn, OnAcceptRedirectResp, OnAcceptResp, OnRequestExpectHttpBodyResp, OnRequestResp, Proxy, Request, RequestHandle};
+use crate::lua_config::{Cacheability, CachedValue, Client, ClientHandle, Context, ContextHandle, HeadersPatchBlock, Hook, HookCacheKeyKind, LuaState, OnAcceptDenyResp, OnAcceptExpectHttpResp, OnAcceptFn, OnAcceptRedirectResp, OnAcceptResp, OnRequestExpectHttpBodyResp, OnRequestResp, Proxy, Request, RequestHandle};
 use crate::lua_module::{HookResult, ProxyModule, ProxyModuleTable};
 use mlua::prelude::*;
 use monoio::buf::{IoBuf, IoBufMut};
@@ -125,63 +125,27 @@ fn transfer_value_between_states(
     }
 }
 
-async fn resolve_backend<'a>(
-    host: &'a str,
-    client: Client,
-    req: Request,
+async fn run_hooks(
+    host: &str,
+    client: &Client,
+    req: &Request,
     mut context: Context,
     state: &LuaState,
-    module_table: &ProxyModuleTable,
-) -> io::Result<(String, Option<Vec<(String, String)>>)> {
+    module_table: &ProxyModuleTable
+) {
     let hooks = &state.hooks;
-    // return Ok(("127.0.0.1:8000".into(), None));
-    // hook call can now yield (call_async), so no borrow may be held across an await.
-    // so we just snapshot the hook info for all the hooks for this host, and then iterate over that snapshot, reading/writing the cache as needed.
-    struct HookSnapshot {
-        idx: usize,
-        name: Box<str>,
-        ttl: Option<Duration>,
-        key: Option<String>,
-    }
+    let n = hooks.borrow().get(host).map(|v| v.borrow().len()).unwrap_or(0);
+    for i in 0..n {
+        let (module, cache_ttl, key) = hook_at(host, i, client, req, state, module_table);
 
-    let host_hooks: Vec<HookSnapshot> = {
-        let map = hooks.borrow();
-        match map.get(host) {
-            Some(v) => v
-                .borrow()
-                .iter()
-                .enumerate()
-                .map(|(idx, h)| HookSnapshot {
-                    idx,
-                    name: h.name.as_str().into(),
-                    ttl: h.cache_ttl,
-                    key: h.cache_key_kind.as_ref().map(|k| match k {
-                        HookCacheKeyKind::Url => req.0.path.clone(),
-                        HookCacheKeyKind::Header(hh) => {
-                            req.0.headers.get(hh).cloned().unwrap_or_default()
-                        }
-                        HookCacheKeyKind::Ip => client.0.ip.clone(),
-                        HookCacheKeyKind::Custom(c) => c.clone(),
-                    }),
-                })
-                .collect(),
-            None => Vec::new(),
-        }
-    };
-
-    for ss in host_hooks {
-        let cached: Option<HookResult> = if let Some(ref k) = ss.key {
-            let map = hooks.borrow();
-            let hv = map.get(host).unwrap().borrow();
-            hv[ss.idx].cached_result.get(k).and_then(|c| c.get().cloned())
+        let cached: Option<HookResult> = if let Some(k) = &key {
+            hooks.borrow().get(host).unwrap().borrow()[i].cached_result.get(k).and_then(|c| c.get().cloned())
         } else {
             None
         };
-
         let resp: Option<HookResult> = if cached.is_some() {
             cached
         } else {
-            let module = module_table.modules.get(&ss.name).unwrap().clone();
             let f = module.hook_handler.borrow().as_ref().cloned();
             if let Some(f) = f {
                 let h = module.pool.checkout();
@@ -193,19 +157,16 @@ async fn resolve_backend<'a>(
                 // so this request keeps its own pool entry while suspended.
                 let r = f.call_async::<HookResult>((&h.client_ud, &h.req_ud)).await.unwrap();
 
-                if let (Some(t), Some(k)) = (ss.ttl, ss.key.as_ref()) {
+                if let (Some(t), Some(k)) = (cache_ttl, key) {
                     let map = hooks.borrow();
                     let mut hv = map.get(host).unwrap().borrow_mut();
-                    hv[ss.idx]
-                        .cached_result
-                        .insert(k.clone(), CachedValue::new(r.clone(), t));
+                    hv[i].cached_result.insert(k.clone(), CachedValue::new(r.clone(), t));
                 }
                 Some(r)
             } else {
                 None
             }
         };
-
         if let Some(HookResult::ContinueWithCtx(update_ctx)) = resp {
             for (key, val) in update_ctx.updates.iter() {
                 if let Ok(v) = transfer_value_between_states(val.clone(), &state.lua) {
@@ -214,9 +175,53 @@ async fn resolve_backend<'a>(
             }
         }
     }
+}
+
+
+fn hook_at(
+    host: &str,
+    idx: usize,
+    client: &Client,
+    req: &Request,
+    state: &LuaState,
+    module_table: &ProxyModuleTable
+) -> (Rc<ProxyModule>, Option<Duration>, Option<String>) {
+    let map = state.hooks.borrow();
+    let hv = map.get(host).unwrap().borrow();
+    let h = &hv[idx];
+
+    let (cache_ttl, key) = if let Some(ref c) = h.cacheability {
+        (
+            Some(c.ttl),
+            Some(match &c.key {
+                HookCacheKeyKind::Url => req.0.path.clone(),
+                HookCacheKeyKind::Header(hh) => {
+                    req.0.headers.get(hh).map(|v| v.to_string()).unwrap_or("".into())
+                },
+                HookCacheKeyKind::Ip => client.0.ip.clone(),
+                HookCacheKeyKind::Custom(c) => c.clone(),
+            })
+        )
+    } else {
+        (None, None)
+    };
+
+    let module = module_table.modules.get(h.name.as_str()).unwrap().clone();
+    (module, cache_ttl, key)
+}
+
+async fn resolve_backend(
+    host: &str,
+    client: Client,
+    req: Request,
+    context: Context,
+    state: &LuaState,
+    module_table: &ProxyModuleTable,
+) -> io::Result<(String, Option<Vec<(String, String)>>)> {
+    run_hooks(host, &client, &req, context.clone(), state, module_table).await;
 
     let handler_fn = state.req_handlers.borrow();
-    let lua_fn = handler_fn.get(host).unwrap();
+    let lua_fn = handler_fn.get(host).cloned().unwrap();
 
     let call_lua_fn = || {
         let h = state.pool.checkout();
