@@ -3,6 +3,8 @@ use tealr::mlu::{FromLuaExact, FromToLua, TealData, TealDataMethods, TypedFuncti
 use std::{cell::RefCell, fmt::Debug};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::net::IpAddr;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tealr::{ToTypename, create_union_mlua};
@@ -98,7 +100,7 @@ impl ConfHandlePool {
 }
 
 pub struct ClientInner {
-    pub ip: String,
+    pub ip: IpAddr,
     pub port: u16
 }
 
@@ -106,11 +108,8 @@ pub struct ClientInner {
 pub struct Client(pub Arc<ClientInner>);
 
 impl Client {
-    pub fn new(ip: impl Into<String>, port: u16) -> Self {
-        Self(Arc::new(ClientInner{
-            ip: ip.into(),
-            port
-        }))
+    pub fn new(ip: IpAddr, port: u16) -> Self {
+        Self(Arc::new(ClientInner { ip, port }))
     }
 }
 
@@ -120,7 +119,7 @@ teal_name!(ClientHandle, "Client");
 
 impl tealr::mlu::TealData for ClientHandle {
     fn add_fields<F: tealr::mlu::TealDataFields<Self>>(fields: &mut F) {
-        fields.add_field_method_get("ip", |lua, this| lua.create_string(this.0.borrow().client.as_ref().unwrap().0.ip.as_str()));
+        fields.add_field_method_get("ip", |lua, this| lua.create_string(this.0.borrow().client.as_ref().unwrap().0.ip.to_string()));
         fields.add_field_method_get("port", |_, this| Ok(this.0.borrow().client.as_ref().unwrap().0.port));
     }
 }
@@ -310,21 +309,75 @@ impl tealr::mlu::TealData for ContextHandle {
 
 #[derive(Debug)]
 pub struct RequestInner {
-    pub method: String,
-    pub path: String,
-    pub headers: HashMap<String, String>
+    head: Box<[u8]>,
+    method: Range<usize>,
+    path: Range<usize>,
+    headers: Vec<(Range<usize>, Range<usize>)>,
+}
+
+impl RequestInner {
+    #[inline]
+    fn at(&self, r: &Range<usize>) -> &str {
+        unsafe { std::str::from_utf8_unchecked(&self.head[r.clone()]) }
+    }
+
+    pub fn method(&self) -> &str {
+        self.at(&self.method)
+    }
+
+    pub fn path(&self) -> &str {
+        self.at(&self.path)
+    }
+
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| self.at(n) == name)
+            .map(|(_, v)| self.at(v))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.headers.iter().map(|(n, v)| (self.at(n), self.at(v)))
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct Request(pub Arc<RequestInner>);
 
 impl Request {
-    pub fn new(method: impl Into<String>, path: impl Into<String>, headers: HashMap<String, String>) -> Self {
-        Self(Arc::new(RequestInner{
-            method: method.into(),
-            path: path.into(),
-            headers
-        }))
+    /// `head` is the request header directly read from the socket; the ranges are
+    /// offsets into it
+    pub fn new(
+        head: &[u8],
+        method: Range<usize>,
+        path: Range<usize>,
+        headers: Vec<(Range<usize>, Range<usize>)>,
+    ) -> Self {
+        Self(Arc::new(RequestInner { head: head.into(), method, path, headers }))
+    }
+
+    /// For tests
+    pub fn from_parts(method: &str, path: &str, headers: &[(&str, &str)]) -> Self {
+        let mut head = Vec::new();
+        head.extend_from_slice(method.as_bytes());
+        let m = 0..head.len();
+        head.push(b' ');
+        let p_start = head.len();
+        head.extend_from_slice(path.as_bytes());
+        let p = p_start..head.len();
+        head.extend_from_slice(b" HTTP/1.1\r\n");
+        let mut hs = Vec::with_capacity(headers.len());
+        for (n, v) in headers {
+            let n_start = head.len();
+            head.extend_from_slice(n.as_bytes());
+            let nr = n_start..head.len();
+            head.extend_from_slice(b": ");
+            let v_start = head.len();
+            head.extend_from_slice(v.as_bytes());
+            hs.push((nr, v_start..head.len()));
+            head.extend_from_slice(b"\r\n");
+        }
+        Request::new(&head, m, p, hs)
     }
 }
 
@@ -334,23 +387,19 @@ teal_name!(RequestHandle, "Request");
 
 impl tealr::mlu::TealData for RequestHandle {
     fn add_fields<F: tealr::mlu::TealDataFields<Self>>(fields: &mut F) {
-        fields.add_field_method_get("method", |lua, this| lua.create_string(&this.0.borrow().req.as_ref().unwrap().0.method));
-        fields.add_field_method_get("path", |lua, this| lua.create_string(&this.0.borrow().req.as_ref().unwrap().0.path));
+        fields.add_field_method_get("method", |lua, this| lua.create_string(this.0.borrow().req.as_ref().unwrap().0.method()));
+        fields.add_field_method_get("path", |lua, this| lua.create_string(this.0.borrow().req.as_ref().unwrap().0.path()));
         fields.add_field_method_get("headers", |lua, this| {
             let table = lua.create_table()?;
-            for (k, v) in this.0.borrow().req.as_ref().unwrap().0.headers.iter() {
-                table.set(k.clone(), v.clone())?;
+            for (k, v) in this.0.borrow().req.as_ref().unwrap().0.iter() {
+                table.set(k, v)?;
             }
             Ok(table)
         });
     }
     fn add_methods<M: TealDataMethods<Self>>(methods: &mut M) {
-        methods.add_method("header", |lua, this, h: String| {
-            if let Some(v) = this.0.borrow().req.as_ref().unwrap().0.headers.get(&h) {
-                Ok(Some(v.to_string()))
-            } else {
-                Ok(None)
-            }
+        methods.add_method("header", |_, this, h: String| {
+            Ok(this.0.borrow().req.as_ref().unwrap().0.header(&h).map(str::to_string))
         });
     }
 }
@@ -364,13 +413,19 @@ pub struct RespCacheBlock {
 
 #[derive(Debug, Clone)]
 pub struct HeadersPatchBlock {
-    pub add_headers: HashMap<Box<str>, Box<str>>,
-    pub remove_headers: Vec<Box<str>>,
+    pub add_headers: Vec<(String, String)>,
+    pub remove_headers: Vec<String>,
+}
+
+impl HeadersPatchBlock {
+    fn empty() -> Self {
+        HeadersPatchBlock { add_headers: Vec::new(), remove_headers: Vec::new() }
+    }
 }
 
 #[derive(Debug, Clone, tealr::mlu::UserData, ToTypename)]
 pub struct OnRequestExpectHttpBodyResp {
-    pub upstream: Box<str>,
+    pub upstream: String,
     pub max_body_size: usize,
     pub proxy_read_timeout: Option<u32>,
     pub client_body_timeout: Option<u32>,
@@ -420,16 +475,19 @@ impl tealr::mlu::TealData for OnRequestExpectHttpBodyResp {
         });
 
         methods.add_method_mut("add_header", |_, this, (key, val): (String, String)| {
-            this.headers_patch.get_or_insert(
-                HeadersPatchBlock { add_headers: HashMap::new(), remove_headers: Vec::new() }
-            ).add_headers.insert(key.into(), val.into());
+            let p = this.headers_patch.get_or_insert_with(HeadersPatchBlock::empty);
+            match p.add_headers.iter_mut().find(|(k, _)| *k == key) {
+                Some(entry) => entry.1 = val,
+                None => p.add_headers.push((key, val)),
+            }
             Ok(())
         });
 
         methods.add_method_mut("remove_header", |_, this, key: String| {
-            this.headers_patch.get_or_insert(
-                HeadersPatchBlock { add_headers: HashMap::new(), remove_headers: Vec::new() }
-            ).remove_headers.push(key.into());
+            this.headers_patch
+                .get_or_insert_with(HeadersPatchBlock::empty)
+                .remove_headers
+                .push(key);
             Ok(())
         })
     }
@@ -578,7 +636,7 @@ impl TealData for Proxy {
 
         methods.add_method("resp_expect_httpbody", |lua, _, upstream: String| {
             let resp = OnRequestExpectHttpBodyResp {
-                upstream: upstream.into(),
+                upstream,
                 max_body_size: 1048576,
                 proxy_read_timeout: Some(30),
                 client_body_timeout: Some(30),
@@ -657,17 +715,11 @@ impl LuaState {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-use super::*;
+    use super::*;
 
     #[test]
     fn register_handler() -> LuaResult<()> {
-        let mut headers: HashMap<String, String> = HashMap::new();
-        headers.insert("Host".into(), "example.com".into());
-        headers.insert("ContentLength".into(), "64".into());
-
-        let req = Request::new("GET", "path", headers);
+        let req = Request::from_parts("GET", "path", &[("Host", "example.com"), ("ContentLength", "64")]);
 
         let lua_state = LuaState::new(1)?;
 
@@ -705,9 +757,9 @@ use super::*;
         source.exec()?;
 
 
-        let client1 = Client::new("127.0.0.1", 6969);
-        let client2 = Client::new("10.100.1.1", 6969);
-        let client3 = Client::new("192.168.1.1", 6969);
+        let client1 = Client::new("127.0.0.1".parse().unwrap(), 6969);
+        let client2 = Client::new("10.100.1.1".parse().unwrap(), 6969);
+        let client3 = Client::new("192.168.1.1".parse().unwrap(), 6969);
 
         let handle_ud = lua_state.pool.checkout();
         handle_ud.set_client(client1.clone());

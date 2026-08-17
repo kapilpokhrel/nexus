@@ -194,13 +194,9 @@ use super::*;
         let module_table = ProxyModuleTable::new();
         let ctx = Context::new();
 
-        let mut headers: HashMap<String, String> = HashMap::new();
-        headers.insert("Host".into(), "example.com".into());
-        headers.insert("ContentLength".into(), "64".into());
+        let req = Request::from_parts("GET", "path", &[("Host", "example.com"), ("ContentLength", "64")]);
 
-        let req = Request::new("GET", "path", headers);
-
-        let client = Client::new("127.0.0.1", 6969);
+        let client = Client::new("127.0.0.1".parse().unwrap(), 6969);
         for (name, module) in module_table.modules {
             let f = module.hook_handler.borrow().as_ref().cloned();
             if let Some(f) = f {

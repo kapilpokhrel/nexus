@@ -8,6 +8,7 @@ use monoio::buf::{IoBuf, IoBufMut};
 use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
 use monoio::net::{TcpListener, TcpStream};
 use tealr::TypeWalker;
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
@@ -139,7 +140,7 @@ async fn run_hooks(
         let (module, cache_ttl, key) = hook_at(host, i, client, req, state, module_table);
 
         let cached: Option<HookResult> = if let Some(k) = &key {
-            hooks.borrow().get(host).unwrap().borrow()[i].cached_result.get(k).and_then(|c| c.get().cloned())
+            hooks.borrow().get(host).unwrap().borrow()[i].cached_result.get(k.as_ref()).and_then(|c| c.get().cloned())
         } else {
             None
         };
@@ -160,7 +161,7 @@ async fn run_hooks(
                 if let (Some(t), Some(k)) = (cache_ttl, key) {
                     let map = hooks.borrow();
                     let mut hv = map.get(host).unwrap().borrow_mut();
-                    hv[i].cached_result.insert(k.clone(), CachedValue::new(r.clone(), t));
+                    hv[i].cached_result.insert(k.into_owned(), CachedValue::new(r.clone(), t));
                 }
                 Some(r)
             } else {
@@ -168,9 +169,9 @@ async fn run_hooks(
             }
         };
         if let Some(HookResult::ContinueWithCtx(update_ctx)) = resp {
-            for (key, val) in update_ctx.updates.iter() {
-                if let Ok(v) = transfer_value_between_states(val.clone(), &state.lua) {
-                    context.insert(key.clone(), v);
+            for (key, val) in update_ctx.updates {
+                if let Ok(v) = transfer_value_between_states(val, &state.lua) {
+                    context.insert(key, v);
                 }
             }
         }
@@ -178,14 +179,14 @@ async fn run_hooks(
 }
 
 
-fn hook_at(
+fn hook_at<'a>(
     host: &str,
     idx: usize,
-    client: &Client,
-    req: &Request,
+    client: &'a Client,
+    req: &'a Request,
     state: &LuaState,
     module_table: &ProxyModuleTable
-) -> (Rc<ProxyModule>, Option<Duration>, Option<String>) {
+) -> (Rc<ProxyModule>, Option<Duration>, Option<Cow<'a, str>>) {
     let map = state.hooks.borrow();
     let hv = map.get(host).unwrap().borrow();
     let h = &hv[idx];
@@ -194,12 +195,10 @@ fn hook_at(
         (
             Some(c.ttl),
             Some(match &c.key {
-                HookCacheKeyKind::Url => req.0.path.clone(),
-                HookCacheKeyKind::Header(hh) => {
-                    req.0.headers.get(hh).map(|v| v.to_string()).unwrap_or("".into())
-                },
-                HookCacheKeyKind::Ip => client.0.ip.clone(),
-                HookCacheKeyKind::Custom(c) => c.clone(),
+                HookCacheKeyKind::Url => Cow::Borrowed(req.0.path()),
+                HookCacheKeyKind::Header(hh) => Cow::Borrowed(req.0.header(hh).unwrap_or("")),
+                HookCacheKeyKind::Ip => Cow::Owned(client.0.ip.to_string()),
+                HookCacheKeyKind::Custom(c) => Cow::Owned(c.clone()),
             })
         )
     } else {
@@ -234,17 +233,9 @@ async fn resolve_backend(
             .unwrap()
     };
 
-    let handle_resp = |resp: &OnRequestResp| {
+    let handle_resp = |resp: OnRequestResp| {
         if let OnRequestResp::OnRequestExpectHttpBodyResp(b) = resp {
-            if let Some(ref p) = b.headers_patch {
-                let mut add_headers: Vec<(String, String)> = Vec::with_capacity(p.add_headers.len());
-                for (k, v) in p.add_headers.iter() {
-                    add_headers.push((k.to_string(), v.to_string()));
-                }
-                Ok((b.upstream.to_string(), Some(add_headers)))
-            } else {
-                Ok((b.upstream.to_string(), None))
-            }
+            Ok((b.upstream, b.headers_patch.map(|p| p.add_headers)))
         } else {
             Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected response type"))
         }
@@ -267,7 +258,7 @@ async fn resolve_backend(
 
     let resp = call_lua_fn();
     state.lua.remove_hook();
-    handle_resp(&resp)
+    handle_resp(resp)
 }
 
 fn enable_defer_accept(listener: &TcpListener, timeout: Duration) -> io::Result<()> {
@@ -347,7 +338,8 @@ async fn forward_http(
     // request
     let (buf, head, req_line, read_len) = read_headers(buf, &mut client, &mut hdr_buf[..]).await?;
 
-    let client_t = Client::new(client.local_addr().unwrap().ip().to_string(), client.local_addr().unwrap().port());
+    let addr = client.local_addr().unwrap();
+    let client_t = Client::new(addr.ip(), addr.port());
     let context = Context::new();
 
     let (host, req) = get_host_requset(&buf, &hdr_buf, &head, &req_line);
@@ -371,8 +363,10 @@ async fn forward_http(
         temp_buf.extend_from_slice(&buf[0..head.start_of_header]);
         if let Some(headers) = header_add_vec {
             for (k, v) in headers {
-                let line = format!("{k}: {v}\r\n").into_bytes();
-                temp_buf.extend_from_slice(&line);
+                temp_buf.extend_from_slice(k.as_bytes());
+                temp_buf.extend_from_slice(b": ");
+                temp_buf.extend_from_slice(v.as_bytes());
+                temp_buf.extend_from_slice(b"\r\n");
             }
         }
         temp_buf.extend_from_slice(&buf[head.start_of_header..head.header_offset]);
@@ -418,23 +412,21 @@ fn get_host_requset<'a>(
     head: &HttpHead,
     req_line: &RequestInfo,
 ) -> (&'a str, Request) {
-    let mut headers: HashMap<String, String> = HashMap::new();
-    for i in 0..head.header_count.min(64) {
-        let (nr, vr) = unsafe { hdr[i].assume_init_read() };
-        headers.insert(
-            unsafe { std::str::from_utf8_unchecked(&buf[nr]).into() },
-            unsafe { std::str::from_utf8_unchecked(&buf[vr]).into() }
-        );
+    let n = head.header_count.min(64);
+    let mut headers = Vec::with_capacity(n);
+    for i in 0..n {
+        headers.push(unsafe { hdr[i].assume_init_read() });
     }
     let host =
         unsafe { std::str::from_utf8_unchecked(&buf[req_line.host.as_ref().unwrap().clone()]) };
-    let method =
-        unsafe { std::str::from_utf8_unchecked(&buf[req_line.method.as_ref().unwrap().clone()]) };
-    let path =
-        unsafe { std::str::from_utf8_unchecked(&buf[req_line.path.as_ref().unwrap().clone()]) };
     (
         host,
-        Request::new(method, path, headers)
+        Request::new(
+            &buf[..head.header_offset],
+            req_line.method.as_ref().unwrap().clone(),
+            req_line.path.as_ref().unwrap().clone(),
+            headers,
+        ),
     )
 }
 
