@@ -51,13 +51,13 @@ async fn main() {
     net::enable_defer_accept(&listener, Duration::from_secs(1)).unwrap();
 
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
+        let Ok((stream, peer_addr)) = listener.accept().await else {
             continue;
         };
         let state_pass = state.clone();
         let module_table_pass = module_table.clone();
         monoio::spawn(async move {
-            let _r = session::forward_http(stream, state_pass, module_table_pass).await;
+            let _r = session::forward_http(stream, peer_addr, state_pass, module_table_pass).await;
         });
     }
 }

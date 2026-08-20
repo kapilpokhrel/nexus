@@ -7,11 +7,13 @@ use crate::relay::{fwd, send_n, write_request_head, write_response_head};
 use monoio::net::TcpStream;
 use std::io;
 use std::mem::MaybeUninit;
+use std::net::SocketAddr;
 use std::ops::Range;
 use std::rc::Rc;
 
 pub async fn forward_http(
     mut client: TcpStream,
+    peer_addr: SocketAddr,
     state: Rc<LuaState>,
     module_table: Rc<ProxyModuleTable>
 ) -> io::Result<()> {
@@ -22,8 +24,7 @@ pub async fn forward_http(
     // read client request head
     let (buf, head, req_line, read_len) = http::read_headers(buf, &mut client, &mut hdr_buf[..]).await?;
 
-    let addr = client.local_addr().unwrap();
-    let client_t = Client::new(addr.ip(), addr.port());
+    let client_t = Client::new(peer_addr.ip(), peer_addr.port());
     let context = Context::new();
 
     // build host + Request view
