@@ -1,14 +1,13 @@
+use crate::lua_config::HandlePool;
 use mlua::prelude::*;
-use crate::lua_config::ConfHandlePool;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
-
 #[derive(Debug, Clone)]
 pub struct CtxUpdate {
-    pub updates: HashMap<Box<str>, LuaValue>
+    pub updates: HashMap<Box<str>, LuaValue>,
 }
 
 impl LuaUserData for CtxUpdate {
@@ -21,7 +20,7 @@ impl LuaUserData for CtxUpdate {
 }
 
 #[derive(Debug, Clone)]
-struct PassResp();
+pub struct PassResp();
 impl LuaUserData for PassResp {}
 
 #[derive(Debug, Clone)]
@@ -43,7 +42,9 @@ impl FromLua for HookResult {
                     Err(LuaError::FromLuaConversionError {
                         from: "UserData",
                         to: "HookResult".to_string(),
-                        message: Some("Expected a userdata of type CtxUpdate or PassResp".to_string()),
+                        message: Some(
+                            "Expected a userdata of type CtxUpdate or PassResp".to_string(),
+                        ),
                     })
                 }
             }
@@ -61,12 +62,12 @@ pub const HOOK_POOL_SIZE: usize = 8;
 pub struct ProxyModule {
     pub hook_handler: RefCell<Option<LuaFunction>>,
     pub lua: Lua,
-    pub pool: ConfHandlePool,
+    pub pool: HandlePool,
 }
 
 impl ProxyModule {
     pub fn new(lua: Lua) -> Self {
-        let pool = ConfHandlePool::new(lua.clone(), HOOK_POOL_SIZE);
+        let pool = HandlePool::new(lua.clone(), HOOK_POOL_SIZE);
         ProxyModule {
             hook_handler: RefCell::new(None),
             lua,
@@ -93,9 +94,7 @@ impl LuaUserData for Module {
             lua.create_userdata(resp)
         });
 
-        methods.add_method("resp_pass", |lua, _, _: ()| {
-            lua.create_userdata(PassResp())
-        });
+        methods.add_method("resp_pass", |lua, _, _: ()| lua.create_userdata(PassResp()));
     }
 }
 
@@ -108,11 +107,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize)]
 struct ModuleManifest {
     name: String,
-    requires: Vec<String>
+    requires: Vec<String>,
 }
 
 impl ProxyModuleTable {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let mut modules: HashMap<Box<str>, Rc<ProxyModule>> = HashMap::new();
 
         // search for modules in /modules directory and load them
@@ -120,8 +119,8 @@ impl ProxyModuleTable {
         // manifest.toml too for each module which will contain the module name and description and version; and permission later
         let modules_dir = std::path::Path::new("./modules");
         if modules_dir.exists() && modules_dir.is_dir() {
-            for entry in std::fs::read_dir(modules_dir).unwrap() {
-                let entry = entry.unwrap();
+            for entry in std::fs::read_dir(modules_dir)? {
+                let entry = entry?;
                 let path = entry.path();
                 if path.is_dir() {
                     let manifest_path = path.join("manifest.toml");
@@ -129,17 +128,16 @@ impl ProxyModuleTable {
                     if !manifest_path.exists() || !main_path.exists() {
                         continue;
                     }
-                    let manifest = std::fs::read_to_string(manifest_path).unwrap();
-                    let manifest: ModuleManifest = toml::from_str(&manifest).unwrap();
+                    let manifest = std::fs::read_to_string(manifest_path)?;
+                    let manifest: ModuleManifest = toml::from_str(&manifest)?;
                     let module_name = manifest.name;
                     let module_requires = manifest.requires;
-                    let main_script = std::fs::read_to_string(main_path).unwrap();
-
+                    let main_script = std::fs::read_to_string(main_path)?;
 
                     let lua = unsafe { Lua::unsafe_new() };
 
                     // Save the original require
-                    let original_require: LuaFunction = lua.globals().get("require").unwrap();
+                    let original_require: LuaFunction = lua.globals().get("require")?;
 
                     let require = lua.create_function(move |_, name: String| {
                         if module_requires.contains(&name.to_string()) {
@@ -150,34 +148,29 @@ impl ProxyModuleTable {
                                 name
                             )))
                         }
-                    }).unwrap();
+                    })?;
 
-                    lua.globals().set("require", require);
+                    lua.globals().set("require", require)?;
 
                     // async primitive that yields: `conduit.sleep(ms)`
-                    let conduit = lua.create_table().unwrap();
-                    let sleep = lua
-                        .create_async_function(|_, ms: u64| async move {
-                            monoio::time::sleep(Duration::from_millis(ms)).await;
-                            Ok(())
-                        })
-                        .unwrap();
-                    conduit.set("sleep", sleep).unwrap();
-                    lua.globals().set("conduit", conduit).unwrap();
+                    let conduit = lua.create_table()?;
+                    let sleep = lua.create_async_function(|_, ms: u64| async move {
+                        monoio::time::sleep(Duration::from_millis(ms)).await;
+                        Ok(())
+                    })?;
+                    conduit.set("sleep", sleep)?;
+                    lua.globals().set("conduit", conduit)?;
 
                     let module = Rc::new(ProxyModule::new(lua.clone()));
-                    let module_ud = lua.create_userdata(Module(module.clone())).unwrap();
-                    lua.globals().set(module_name.clone(), module_ud).unwrap();
-                    lua.load(&main_script).exec().unwrap();
+                    let module_ud = lua.create_userdata(Module(module.clone()))?;
+                    lua.globals().set(module_name.clone(), module_ud)?;
+                    lua.load(&main_script).exec()?;
 
                     modules.insert(module_name.into(), module.clone());
-
                 }
             }
         }
-        ProxyModuleTable {
-            modules,
-        }
+        Ok(ProxyModuleTable { modules })
     }
 }
 
@@ -185,16 +178,18 @@ impl ProxyModuleTable {
 mod tests {
     use crate::lua_config::{Client, Context, Request};
 
-use super::*;
-
+    use super::*;
 
     #[test]
     fn modules_load() -> LuaResult<()> {
-        let lua = Lua::new();
-        let module_table = ProxyModuleTable::new();
+        let module_table = ProxyModuleTable::new().unwrap();
         let ctx = Context::new();
 
-        let req = Request::from_parts("GET", "path", &[("Host", "example.com"), ("ContentLength", "64")]);
+        let req = Request::from_parts(
+            "GET",
+            "path",
+            &[("Host", "example.com"), ("ContentLength", "64")],
+        );
 
         let client = Client::new("127.0.0.1".parse().unwrap(), 6969);
         for (name, module) in module_table.modules {
