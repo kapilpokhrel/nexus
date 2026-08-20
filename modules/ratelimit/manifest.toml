@@ -1,2 +1,0 @@
-name="ratelimit"
-requires=["redis", "socket", "string", "math", "socket.core"]

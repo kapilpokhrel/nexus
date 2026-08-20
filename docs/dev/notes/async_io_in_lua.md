@@ -15,7 +15,7 @@ Since the program state will goto lua side when we call a lua function, it can n
 
 To test that, i made a lua module that calls a socket:sleep inside a lua function and sleeps for 15ms. Lets see how devastating that is
 
-![Concurrency Curve with sleeptest module (blocking)](concurrency_curve_pics/sleeptest_blocking.png)
+![Concurrency Curve with sleeptest module (blocking)](pics/sleeptest_blocking.png)
 *Concurrency Curve with sleeptest module (blocking)*
 
 We have 8 threads
@@ -32,7 +32,7 @@ If the module calls that. we get something like.
 
 **Note: Now it is 50ms wait, not 15.**
 
-![Concurrency Curve with sleeptest module (non blocking)](concurrency_curve_pics/sleeptest_nonblock.png)
+![Concurrency Curve with sleeptest module (non blocking)](pics/sleeptest_nonblock.png)
 *Concurrency Curve with sleeptest module (non blocking)*
 
 In lower concurrency, all the requests are sleeping. They yielded, proxy has the capacity but the incomming requests are limited.
