@@ -54,6 +54,7 @@ async fn main() {
         let Ok((stream, peer_addr)) = listener.accept().await else {
             continue;
         };
+        let _ = stream.set_nodelay(true);
         let state_pass = state.clone();
         let module_table_pass = module_table.clone();
         monoio::spawn(async move {

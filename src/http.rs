@@ -1,3 +1,4 @@
+use crate::lua_config::Request;
 use monoio::buf::IoBufMut;
 use monoio::io::AsyncReadRent;
 use monoio::net::TcpStream;
@@ -21,6 +22,7 @@ pub struct RequestInfo {
     pub host: Option<Range<usize>>,
     pub method: Option<Range<usize>>,
     pub path: Option<Range<usize>>,
+    pub version: Option<Range<usize>>,
 }
 
 pub fn range_of(buf: &[u8], sub: &[u8]) -> Range<usize> {
@@ -33,7 +35,7 @@ pub fn host_and_request<'a>(
     hdr: &[MaybeUninit<(Range<usize>, Range<usize>)>; MAX_HEADERS],
     head: &HttpHead,
     req_line: &RequestInfo,
-) -> (&'a str, crate::lua_config::Request) {
+) -> (&'a str, Request) {
     let n = head.header_count.min(MAX_HEADERS);
     let mut headers = Vec::with_capacity(n);
     for i in 0..n {
@@ -43,13 +45,32 @@ pub fn host_and_request<'a>(
         unsafe { std::str::from_utf8_unchecked(&buf[req_line.host.as_ref().unwrap().clone()]) };
     (
         host,
-        crate::lua_config::Request::new(
+        Request::new(
             &buf[..head.header_offset],
             req_line.method.as_ref().unwrap().clone(),
             req_line.path.as_ref().unwrap().clone(),
             headers,
         ),
     )
+}
+
+/// Whether the client's request indicates the connection should be kept open
+/// after this response: an explicit `Connection` header wins, otherwise it
+/// falls back to the protocol default (persistent for HTTP/1.1+, not for HTTP/1.0).
+pub fn client_wants_keep_alive(buf: &[u8], req_line: &RequestInfo, req: &Request) -> bool {
+    if let Some(v) = req.0.header("Connection") {
+        let mut tokens = v.split(',').map(|t| t.trim());
+        if tokens.clone().any(|t| t.eq_ignore_ascii_case("close")) {
+            return false;
+        }
+        if tokens.any(|t| t.eq_ignore_ascii_case("keep-alive")) {
+            return true;
+        }
+    }
+    match &req_line.version {
+        Some(r) => !buf[r.clone()].eq_ignore_ascii_case(b"HTTP/1.0"),
+        None => false,
+    }
 }
 
 pub async fn read_headers(
@@ -101,7 +122,7 @@ pub async fn read_headers(
                     .map(|h| range_of(&buf, h.value));
                 let h_count = parsed.len();
 
-                let (method, path) = {
+                let (method, path, version) = {
                     let req = &buf[..se - 2];
                     let sp1 = req.iter().position(|&b| b == b' ');
                     let sp2 = sp1.and_then(|i| {
@@ -112,9 +133,9 @@ pub async fn read_headers(
                     });
                     match (sp1, sp2) {
                         (Some(e), Some(s)) if !req[..e].contains(&b'/') => {
-                            (Some(0..e), Some(e + 1..s))
+                            (Some(0..e), Some(e + 1..s), Some(s + 1..req.len()))
                         }
-                        _ => (None, None),
+                        _ => (None, None, None),
                     }
                 };
 
@@ -127,7 +148,7 @@ pub async fn read_headers(
                         header_count: h_count,
                         header_offset: header_end,
                     },
-                    RequestInfo { host, method, path },
+                    RequestInfo { host, method, path, version },
                     ptr,
                 ));
             }
