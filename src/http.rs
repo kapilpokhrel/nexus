@@ -116,6 +116,16 @@ pub async fn read_headers(
                             .split(|&b| b == b',')
                             .any(|v| v.trim_ascii().eq_ignore_ascii_case(b"chunked"))
                 });
+                // a message claiming both framings is the classic request-smuggling
+                // ambiguity (RFC 7230 §3.3.3): different hops could pick different
+                // ones, so refuse to guess and drop the message instead
+                if cl.is_some() && chunked {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "ambiguous message framing: both Content-Length and chunked Transfer-Encoding present",
+                    ));
+                }
+
                 let host = parsed
                     .iter()
                     .find(|h| h.name.eq_ignore_ascii_case("Host"))
