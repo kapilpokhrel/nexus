@@ -47,13 +47,14 @@ pub async fn forward_http(
         // relay request head + body
         let in_buf = read_len.saturating_sub(head.header_offset);
         buf = if let Some(n) = head.content_len {
-            let b = fwd(buf, &mut backend, head.header_offset + in_buf.min(n), 0).await?;
+            let b = write_request_head(buf, &mut backend, &head, header_add_vec, in_buf.min(n)).await?;
             send_n(b, &mut client, &mut backend, n.saturating_sub(in_buf)).await?
         } else if head.chunked {
-            let b = fwd(buf, &mut backend, head.header_offset, 0).await?;
+            // relay_chunked starts at header_offset, so the head is written alone here
+            let b = write_request_head(buf, &mut backend, &head, header_add_vec, 0).await?;
             relay_chunked(b, head.header_offset, read_len, &mut client, &mut backend).await?
         } else {
-            write_request_head(buf, &mut backend, &head, header_add_vec).await?
+            write_request_head(buf, &mut backend, &head, header_add_vec, 0).await?
         };
 
         // read upstream response head
@@ -68,16 +69,17 @@ pub async fn forward_http(
 
         // relay response head + body
         if let Some(n) = head.content_len {
-            let b = write_response_head(buf, &mut client, &head, &hdr_buf, keep_alive).await?;
-
             // the initial read from backend may have already captured some (or
-            // all) of the body alongside the headers; forward that portion
-            // before pulling any remaining bytes straight from the backend
+            // all) of the body alongside the headers; it goes out with the head
             let in_buf = read_len.saturating_sub(head.header_offset);
-            let b = fwd(b, &mut client, in_buf.min(n), head.header_offset).await?;
+            let b = write_response_head(
+                buf, &mut client, &head, &hdr_buf, keep_alive, in_buf.min(n),
+            )
+            .await?;
             buf = send_n(b, &mut backend, &mut client, n.saturating_sub(in_buf)).await?;
         } else if head.chunked {
-            let b = write_response_head(buf, &mut client, &head, &hdr_buf, keep_alive).await?;
+            let b =
+                write_response_head(buf, &mut client, &head, &hdr_buf, keep_alive, 0).await?;
             buf = relay_chunked(b, head.header_offset, read_len, &mut backend, &mut client).await?;
         } else {
             buf = fwd(buf, &mut client, head.header_offset, 0).await?;

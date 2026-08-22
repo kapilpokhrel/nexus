@@ -42,11 +42,15 @@ pub async fn send_n(
     Ok(buf)
 }
 
+/// `body_prefix` is how many body bytes already sit in `buf` right after the
+/// head; they go out in the same write so the head and the start of the body
+/// are one segment instead of two.
 pub async fn write_request_head(
     buf: Vec<u8>,
     dst: &mut TcpStream,
     head: &HttpHead,
     extra_headers: Option<Vec<(String, String)>>,
+    body_prefix: usize,
 ) -> io::Result<Vec<u8>> {
     let mut temp_buf: Vec<u8> = Vec::with_capacity(256 + head.header_offset);
     temp_buf.extend_from_slice(&buf[0..head.start_of_header]);
@@ -59,6 +63,7 @@ pub async fn write_request_head(
         }
     }
     temp_buf.extend_from_slice(&buf[head.start_of_header..head.header_offset]);
+    temp_buf.extend_from_slice(&buf[head.header_offset..head.header_offset + body_prefix]);
     let (res, _) = dst.write_all(temp_buf).await;
     res?;
     Ok(buf)
@@ -207,6 +212,7 @@ pub async fn write_response_head(
     head: &HttpHead,
     hdr_ranges: &[MaybeUninit<(Range<usize>, Range<usize>)>],
     keep_alive: bool,
+    body_prefix: usize,
 ) -> io::Result<Vec<u8>> {
     let mut temp_buf: Vec<u8> = Vec::with_capacity(256 + head.header_offset);
     temp_buf.extend_from_slice(&buf[0..head.start_of_header]);
@@ -226,6 +232,7 @@ pub async fn write_response_head(
         temp_buf.extend_from_slice(b"\r\n");
     }
     temp_buf.extend_from_slice(b"\r\n");
+    temp_buf.extend_from_slice(&buf[head.header_offset..head.header_offset + body_prefix]);
     let (res, _) = dst.write_all(temp_buf).await;
     res?;
     Ok(buf)
