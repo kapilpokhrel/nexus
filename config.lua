@@ -7,4 +7,5 @@ proxy:on_request("example.com", function(client, req, context)
     return resp
 end)
 
+proxy:keep_alive(false)
 proxy:listen_on("127.0.0.1:5000")

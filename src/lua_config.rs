@@ -5,7 +5,7 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::{cell::RefCell, fmt::Debug};
+use std::{cell::Cell, cell::RefCell, fmt::Debug};
 use tealr::mlu::{FromLuaExact, TealData, TealDataMethods, TypedFunction};
 use tealr::{ToTypename, create_union_mlua};
 
@@ -616,8 +616,10 @@ impl FromLua for Cacheability {
 pub type HandlerMap = Rc<RefCell<HashMap<Box<str>, LuaFunction>>>;
 pub type OnAcceptFnSlot = Rc<RefCell<Option<LuaFunction>>>;
 pub type HooksMap = Rc<RefCell<HashMap<Box<str>, RefCell<Vec<Hook>>>>>;
+pub type KeepAliveFlag = Rc<Cell<bool>>;
 #[derive(Debug, tealr::mlu::UserData, ToTypename)]
 pub struct Proxy {
+    pub keep_alive: KeepAliveFlag,
     pub on_accept_fn: OnAcceptFnSlot,
     pub req_handlers: HandlerMap,
     pub hooks: HooksMap,
@@ -628,6 +630,13 @@ impl TealData for Proxy {
     fn add_methods<M: TealDataMethods<Self>>(methods: &mut M) {
         methods.add_method_mut("listen_on", |_, this, addr: String| {
             this.listen_addr = addr.into();
+            Ok(())
+        });
+
+        // on by default;
+        // do we honour client keep-alive or not?
+        methods.add_method("keep_alive", |_, this, on: bool| {
+            this.keep_alive.set(on);
             Ok(())
         });
 
@@ -738,6 +747,7 @@ impl TealData for Proxy {
 
 pub struct LuaConf {
     pub lua: Lua,
+    pub keep_alive: KeepAliveFlag,
     pub req_handlers: HandlerMap,
     pub on_accept_fn: OnAcceptFnSlot,
     pub hooks: HooksMap,
@@ -749,8 +759,10 @@ impl LuaConf {
         let req_handlers: HandlerMap = Rc::new(RefCell::new(HashMap::new()));
         let on_accept_fn: OnAcceptFnSlot = Rc::new(RefCell::new(None));
         let hooks: HooksMap = Rc::new(RefCell::new(HashMap::new()));
+        let keep_alive: KeepAliveFlag = Rc::new(Cell::new(true));
 
         let proxy = Proxy {
+            keep_alive: keep_alive.clone(),
             req_handlers: req_handlers.clone(),
             on_accept_fn: on_accept_fn.clone(),
             listen_addr: "".into(),
@@ -769,6 +781,7 @@ impl LuaConf {
 
         Ok(LuaConf {
             lua,
+            keep_alive,
             req_handlers,
             on_accept_fn,
             hooks,

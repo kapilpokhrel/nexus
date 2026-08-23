@@ -69,7 +69,9 @@ pub async fn forward_http(
         // a response with no Content-Length and no chunked framing has no
         // reliable end-of-body signal short of closing the connection, so
         // keep-alive needs one or the other
-        let keep_alive = keep_alive_requested && (head.content_len.is_some() || head.chunked);
+        let keep_alive = state.keep_alive.get()
+            && keep_alive_requested
+            && (head.content_len.is_some() || head.chunked);
 
         // relay response head + body
         if let Some(n) = head.content_len {
