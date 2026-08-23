@@ -1,5 +1,5 @@
 use crate::lua_config::{
-    CachedValue, Client, Context, HookCacheKeyKind, LuaConf, OnRequestResp, Request,
+    CachedValue, Client, Context, HookCacheKeyKind, LuaConf, OnAcceptResp, OnRequestResp, Request,
 };
 use crate::lua_module::{HookResult, ProxyModule, ProxyModuleTable};
 use mlua::prelude::*;
@@ -7,6 +7,10 @@ use std::borrow::Cow;
 use std::io;
 use std::rc::Rc;
 use std::time::Duration;
+
+/// Headers the config handler asked to add to the upstream request.
+pub type ExtraHeaders = Option<Vec<(String, String)>>;
+pub type Backend = (String, ExtraHeaders);
 
 /// Deep-copies an arbitrary Lua value from its original state into a completely different Lua state.
 fn transfer_value_between_states(val: LuaValue, dest_lua: &Lua) -> mlua::Result<LuaValue> {
@@ -140,7 +144,7 @@ pub async fn resolve_backend(
     context: Context,
     state: &LuaConf,
     module_table: &ProxyModuleTable,
-) -> io::Result<(String, Option<Vec<(String, String)>>)> {
+) -> io::Result<Backend> {
     run_hooks(host, &client, &req, context.clone(), state, module_table).await;
 
     let handler_fn = state.req_handlers.borrow();
@@ -189,4 +193,20 @@ pub async fn resolve_backend(
     let resp = call_lua_fn();
     state.lua.remove_hook();
     handle_resp(resp)
+}
+
+/// Runs `proxy:on_accept(client)` if the config defined one. `false` means the
+/// connection was denied and should be dropped without reading a request.
+/// Only understand DenyResp right now
+pub fn accept_allowed(state: &LuaConf, client: &Client) -> io::Result<bool> {
+    let f = state.on_accept_fn.borrow().clone();
+    let Some(f) = f else { return Ok(true) };
+
+    let h = state.pool.checkout();
+    h.set_client(client.clone());
+    let resp = f
+        .call::<OnAcceptResp>(&h.client_ud)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+    Ok(!matches!(resp, OnAcceptResp::OnAcceptDenyResp(_)))
 }

@@ -22,6 +22,10 @@ pub async fn forward_http(
         [const { MaybeUninit::uninit() }; MAX_HEADERS];
     let client_t = Client::new(peer_addr.ip(), peer_addr.port());
 
+    if !resolve::accept_allowed(&state, &client_t)? {
+        return Ok(());
+    }
+
     // one client connection can carry many requests when kept alive; each
     // iteration is one full request/response exchange, reusing buf and hdr_buf
     loop {

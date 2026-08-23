@@ -612,11 +612,15 @@ impl FromLua for Cacheability {
     }
 }
 
+
+pub type HandlerMap = Rc<RefCell<HashMap<Box<str>, LuaFunction>>>;
+pub type OnAcceptFnSlot = Rc<RefCell<Option<LuaFunction>>>;
+pub type HooksMap = Rc<RefCell<HashMap<Box<str>, RefCell<Vec<Hook>>>>>;
 #[derive(Debug, tealr::mlu::UserData, ToTypename)]
 pub struct Proxy {
-    pub on_accept_fn: Rc<RefCell<Option<LuaFunction>>>,
-    pub req_handlers: Rc<RefCell<HashMap<Box<str>, LuaFunction>>>,
-    pub hooks: Rc<RefCell<HashMap<Box<str>, RefCell<Vec<Hook>>>>>,
+    pub on_accept_fn: OnAcceptFnSlot,
+    pub req_handlers: HandlerMap,
+    pub hooks: HooksMap,
     pub listen_addr: Box<str>,
 }
 
@@ -732,25 +736,19 @@ impl TealData for Proxy {
     }
 }
 
-type HandlerMap = Rc<RefCell<HashMap<Box<str>, LuaFunction>>>;
-type OnAcceptFnType = Rc<RefCell<Option<LuaFunction>>>;
-type HooksMap = Rc<RefCell<HashMap<Box<str>, RefCell<Vec<Hook>>>>>;
-
 pub struct LuaConf {
     pub lua: Lua,
     pub req_handlers: HandlerMap,
-    pub on_accept_fn: OnAcceptFnType,
+    pub on_accept_fn: OnAcceptFnSlot,
     pub hooks: HooksMap,
     pub pool: HandlePool,
 }
 
 impl LuaConf {
     pub fn new(pool_size: usize) -> Result<Self, LuaError> {
-        let req_handlers: Rc<RefCell<HashMap<Box<str>, LuaFunction>>> =
-            Rc::new(RefCell::new(HashMap::new()));
-        let on_accept_fn: Rc<RefCell<Option<LuaFunction>>> = Rc::new(RefCell::new(None));
-        let hooks: Rc<RefCell<HashMap<Box<str>, RefCell<Vec<Hook>>>>> =
-            Rc::new(RefCell::new(HashMap::new()));
+        let req_handlers: HandlerMap = Rc::new(RefCell::new(HashMap::new()));
+        let on_accept_fn: OnAcceptFnSlot = Rc::new(RefCell::new(None));
+        let hooks: HooksMap = Rc::new(RefCell::new(HashMap::new()));
 
         let proxy = Proxy {
             req_handlers: req_handlers.clone(),

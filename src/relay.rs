@@ -1,4 +1,5 @@
 use crate::http::{HttpHead, MAX_HEADERS};
+use crate::resolve::ExtraHeaders;
 use monoio::buf::{IoBuf, IoBufMut};
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::TcpStream;
@@ -49,7 +50,7 @@ pub async fn write_request_head(
     buf: Vec<u8>,
     dst: &mut TcpStream,
     head: &HttpHead,
-    extra_headers: Option<Vec<(String, String)>>,
+    extra_headers: ExtraHeaders,
     body_prefix: usize,
 ) -> io::Result<Vec<u8>> {
     let mut temp_buf: Vec<u8> = Vec::with_capacity(256 + head.header_offset);
