@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-URL="http://127.0.0.1:6000"
+URL="http://127.0.0.1:5000"
 DURATION=30s
 
 CONCURRENCY=(
-10
-20
 50
 75
 100
@@ -18,7 +16,7 @@ CONCURRENCY=(
 600
 700
 )
-
+THREADS=8
 mkdir -p results
 
 echo "concurrency,rps,mean_ms,p50_ms,p75_ms,p90_ms,p99_ms,errors" \
@@ -26,8 +24,6 @@ echo "concurrency,rps,mean_ms,p50_ms,p75_ms,p90_ms,p99_ms,errors" \
 
 for c in "${CONCURRENCY[@]}"
 do
-    THREADS=$((c / 10))
-    (( THREADS < 1 )) && THREADS=1
     echo "Concurrency $c"
     out=$(
         wrk \
