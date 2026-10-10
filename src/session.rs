@@ -37,7 +37,7 @@ pub async fn forward_http(
         let keep_alive_requested = http::client_wants_keep_alive(&buf, &req_line, &req);
 
         // decide upstream
-        let (backend_addr, header_add_vec) =
+        let (backend_addr, header_add_vec, client_keepalive_setting) =
             resolve::resolve_backend(host, client_t.clone(), req, &state)
                 .await?;
 
@@ -65,7 +65,7 @@ pub async fn forward_http(
         // a response with no Content-Length and no chunked framing has no
         // reliable end-of-body signal short of closing the connection, so
         // keep-alive needs one or the other
-        let keep_alive = state.keep_alive.get()
+        let client_keepalive = client_keepalive_setting
             && keep_alive_requested
             && (head.content_len.is_some() || head.chunked);
 
@@ -75,13 +75,13 @@ pub async fn forward_http(
             // all) of the body alongside the headers; it goes out with the head
             let in_buf = read_len.saturating_sub(head.header_offset);
             let b = write_response_head(
-                buf, &mut client, &head, &hdr_buf, keep_alive, in_buf.min(n),
+                buf, &mut client, &head, &hdr_buf, client_keepalive, in_buf.min(n),
             )
             .await?;
             buf = send_n(b, &mut backend, &mut client, n.saturating_sub(in_buf)).await?;
         } else if head.chunked {
             let b =
-                write_response_head(buf, &mut client, &head, &hdr_buf, keep_alive, 0).await?;
+                write_response_head(buf, &mut client, &head, &hdr_buf, client_keepalive, 0).await?;
             buf = relay_chunked(b, head.header_offset, read_len, &mut backend, &mut client).await?;
         } else {
             buf = fwd(buf, &mut client, head.header_offset, 0).await?;
@@ -90,7 +90,7 @@ pub async fn forward_http(
         // return connection to the pool
         net::put_conn(backend_addr, backend).await;
 
-        if !keep_alive {
+        if !client_keepalive {
             return Ok(());
         }
     }

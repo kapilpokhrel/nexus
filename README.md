@@ -48,22 +48,22 @@ Here's the sequence you should know before you use this.
 ```lua
 proxy:on_accept(function(client)
     if client.ip == "10.100.1.1" then
-        local resp = proxy:resp_expect_http()
-        resp:set_max_header_size(16384)
-        resp:set_max_header_count(128)
-        resp:set_expected_method("GET")
-        return resp
+        local handler_resp = proxy:expect_http()
+        handler_resp:set_max_header_size(16384)
+        handler_resp:set_max_header_count(128)
+        handler_resp:set_expected_method("GET")
+        return handler_resp
     else
-        return proxy:resp_deny("NOPE")
+        return proxy:deny("NOPE")
     end
 end)
 ```
 - **`on_request`** will be called after parsing the request http with client and request information. It decides where to send this request (upstream) and it can do some request bending as well if needed.
 ```lua
 proxy:on_request("example.com", function(client, req)
-    resp = proxy:resp_expect_httpbody("127.0.0.1:8000")
-    resp:add_header("X_PROXY", "CONDUIT")
-    return resp
+    handler_resp = proxy:forward_http("127.0.0.1:8000")
+    handler_resp:add_header("X_PROXY", "CONDUIT")
+    return handler_resp
 end)
 ```
 
@@ -71,12 +71,12 @@ All this and other setting will go in `config.lua` as
 ```lua
 -- proxy:on_accept skipped
 proxy:on_request("example.com", function(client, req)
-    resp = proxy:resp_expect_httpbody("127.0.0.1:8000")
-    resp:add_header("X_GREETING", "HELLO")
-    return resp
+    handler_resp = proxy:forward_http("127.0.0.1:8000")
+    handler_resp:keep_alive(false)
+    handler_resp:add_header("X_GREETING", "HELLO")
+    return handler_resp
 end)
 
-proxy:keep_alive(false)
 proxy:listen_on("127.0.0.1:5000")
 ```
 

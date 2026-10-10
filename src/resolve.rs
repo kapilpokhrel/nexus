@@ -1,12 +1,12 @@
 use crate::lua_config::{
-    Client, LuaConf, OnAcceptResp, OnRequestResp, Request,
+    Client, LuaConf, OnAcceptHandlerResp, OnRequestHandlerResp, Request,
 };
 use mlua::prelude::*;
 use std::io;
 
 /// Headers the config handler asked to add to the upstream request.
 pub type ExtraHeaders = Option<Vec<(String, String)>>;
-pub type Backend = (String, ExtraHeaders);
+pub type Backend = (String, ExtraHeaders, bool); // address, extra headers, keep-alive
 
 ///// Deep-copies an arbitrary Lua value from its original state into a completely different Lua state.
 // fn transfer_value_between_states(val: LuaValue, dest_lua: &Lua) -> mlua::Result<LuaValue> {
@@ -54,13 +54,13 @@ pub async fn resolve_backend(
         h.set_req(req.clone());
 
         lua_fn
-            .call::<OnRequestResp>((&h.client_ud, &h.req_ud))
+            .call::<OnRequestHandlerResp>((&h.client_ud, &h.req_ud))
             .unwrap()
     };
 
-    let handle_resp = |resp: OnRequestResp| {
-        if let OnRequestResp::OnRequestExpectHttpBodyResp(b) = resp {
-            Ok((b.upstream, b.headers_patch.map(|p| p.add_headers)))
+    let handle_resp = |resp: OnRequestHandlerResp| {
+        if let OnRequestHandlerResp::ForwardHttp(b) = resp {
+            Ok((b.upstream, b.headers_patch.map(|p| p.add_headers), b.keep_alive))
         } else {
             Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -96,7 +96,7 @@ pub async fn resolve_backend(
 
 /// Runs `proxy:on_accept(client)` if the config defined one. `false` means the
 /// connection was denied and should be dropped without reading a request.
-/// Only understand DenyResp right now
+/// Only understand Deny handler response right now
 pub fn accept_allowed(state: &LuaConf, client: &Client) -> io::Result<bool> {
     let f = state.on_accept_fn.borrow().clone();
     let Some(f) = f else { return Ok(true) };
@@ -104,8 +104,8 @@ pub fn accept_allowed(state: &LuaConf, client: &Client) -> io::Result<bool> {
     let h = state.pool.checkout();
     h.set_client(client.clone());
     let resp = f
-        .call::<OnAcceptResp>(&h.client_ud)
+        .call::<OnAcceptHandlerResp>(&h.client_ud)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
-    Ok(!matches!(resp, OnAcceptResp::OnAcceptDenyResp(_)))
+    Ok(!matches!(resp, OnAcceptHandlerResp::Deny(_)))
 }

@@ -126,7 +126,7 @@ pub struct OnAcceptTlsBlock {
 }
 
 #[derive(Debug, Clone, tealr::mlu::UserData, ToTypename)]
-pub struct OnAcceptExpectHttpResp {
+pub struct ExpectHttp {
     pub max_header_size: usize,
     pub max_header_count: usize,
     pub expected_method: Box<str>,
@@ -134,23 +134,23 @@ pub struct OnAcceptExpectHttpResp {
     pub tls: OnAcceptTlsBlock,
 }
 
-impl FromLuaExact for OnAcceptExpectHttpResp {
+impl FromLuaExact for ExpectHttp {
     fn from_lua_exact(lua_value: LuaValue, _lua: &Lua) -> LuaResult<Self> {
         match lua_value {
             LuaValue::UserData(ud) if ud.is::<Self>() => {
-                let resp: OnAcceptExpectHttpResp = ud.take::<Self>()?;
+                let resp: ExpectHttp = ud.take::<Self>()?;
                 Ok(resp)
             }
             _ => Err(LuaError::FromLuaConversionError {
                 from: lua_value.type_name(),
-                to: "OnAcceptExpectHttpResp".to_string(),
+                to: "ExpectHttp".to_string(),
                 message: Some("Expected a userdata with 'max_header_size', 'max_header_count', 'expected_method', 'header_timeout', and 'tls' fields".to_string()),
             }),
         }
     }
 }
 
-impl tealr::mlu::TealData for OnAcceptExpectHttpResp {
+impl tealr::mlu::TealData for ExpectHttp {
     fn add_methods<F: tealr::mlu::TealDataMethods<Self>>(fields: &mut F) {
         fields.add_method_mut("set_max_header_size", |_, this, size: usize| {
             this.max_header_size = size;
@@ -179,11 +179,11 @@ impl tealr::mlu::TealData for OnAcceptExpectHttpResp {
 }
 
 #[derive(Debug, Clone, tealr::mlu::UserData, ToTypename)]
-pub struct OnAcceptDenyResp {
+pub struct Deny {
     pub reason: Box<str>,
 }
 
-impl TealData for OnAcceptDenyResp {
+impl TealData for Deny {
     fn add_fields<F: tealr::mlu::TealDataFields<Self>>(fields: &mut F) {
         fields.add_field_method_get("reason", |lua, this| {
             lua.create_string(this.reason.to_string())
@@ -191,16 +191,16 @@ impl TealData for OnAcceptDenyResp {
     }
 }
 
-impl FromLuaExact for OnAcceptDenyResp {
+impl FromLuaExact for Deny {
     fn from_lua_exact(lua_value: LuaValue, _lua: &Lua) -> LuaResult<Self> {
         match lua_value {
             LuaValue::UserData(ud) if ud.is::<Self>() => {
-                let resp: OnAcceptDenyResp = ud.take::<Self>()?;
+                let resp: Deny = ud.take::<Self>()?;
                 Ok(resp)
             }
             _ => Err(LuaError::FromLuaConversionError {
                 from: lua_value.type_name(),
-                to: "OnAcceptDenyResp".to_string(),
+                to: "Deny".to_string(),
                 message: Some("Expected a userdata with 'reason' field".to_string()),
             }),
         }
@@ -208,12 +208,12 @@ impl FromLuaExact for OnAcceptDenyResp {
 }
 
 #[derive(Debug, Clone, tealr::mlu::UserData, ToTypename)]
-pub struct OnAcceptRedirectResp {
+pub struct Redirect {
     pub status: u16,
     pub location: Box<str>,
 }
 
-impl tealr::mlu::TealData for OnAcceptRedirectResp {
+impl tealr::mlu::TealData for Redirect {
     fn add_fields<F: tealr::mlu::TealDataFields<Self>>(fields: &mut F) {
         fields.add_field_method_get("status", |_lua, this| Ok(this.status));
         fields.add_field_method_get("location", |lua, this| {
@@ -222,16 +222,16 @@ impl tealr::mlu::TealData for OnAcceptRedirectResp {
     }
 }
 
-impl FromLuaExact for OnAcceptRedirectResp {
+impl FromLuaExact for Redirect {
     fn from_lua_exact(lua_value: LuaValue, _lua: &Lua) -> LuaResult<Self> {
         match lua_value {
             LuaValue::UserData(ud) if ud.is::<Self>() => {
-                let resp: OnAcceptRedirectResp = ud.take::<Self>()?;
+                let resp: Redirect = ud.take::<Self>()?;
                 Ok(resp)
             }
             _ => Err(LuaError::FromLuaConversionError {
                 from: lua_value.type_name(),
-                to: "OnAcceptRedirectResp".to_string(),
+                to: "Redirect".to_string(),
                 message: Some(
                     "Expected a userdata with 'status' and 'location' fields".to_string(),
                 ),
@@ -240,19 +240,19 @@ impl FromLuaExact for OnAcceptRedirectResp {
     }
 }
 
-create_union_mlua!(pub enum OnAcceptResp = OnAcceptDenyResp | OnAcceptRedirectResp | OnAcceptExpectHttpResp);
+create_union_mlua!(pub enum OnAcceptHandlerResp = Deny | Redirect | ExpectHttp);
 
-impl std::fmt::Debug for OnAcceptResp {
+impl std::fmt::Debug for OnAcceptHandlerResp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            OnAcceptResp::OnAcceptExpectHttpResp(x) => {
-                f.debug_tuple("OnAcceptExpectHttpResp").field(x).finish()
+            OnAcceptHandlerResp::ExpectHttp(x) => {
+                f.debug_tuple("ExpectHttp").field(x).finish()
             }
-            OnAcceptResp::OnAcceptDenyResp(x) => {
-                f.debug_tuple("OnAcceptDenyResp").field(x).finish()
+            OnAcceptHandlerResp::Deny(x) => {
+                f.debug_tuple("Deny").field(x).finish()
             }
-            OnAcceptResp::OnAcceptRedirectResp(x) => {
-                f.debug_tuple("OnAcceptRedirectResp").field(x).finish()
+            OnAcceptHandlerResp::Redirect(x) => {
+                f.debug_tuple("Redirect").field(x).finish()
             }
         }
     }
@@ -397,7 +397,7 @@ impl HeadersPatchBlock {
 }
 
 #[derive(Debug, Clone, tealr::mlu::UserData, ToTypename)]
-pub struct OnRequestExpectHttpBodyResp {
+pub struct ForwardHttp {
     pub upstream: String,
     pub max_body_size: usize,
     pub proxy_read_timeout: Option<u32>,
@@ -405,25 +405,28 @@ pub struct OnRequestExpectHttpBodyResp {
     // bla bla bla
     pub cache: Option<RespCacheBlock>,
     pub headers_patch: Option<HeadersPatchBlock>,
+
+    // do we honour client keep-alive or not? if false, we close the connection after the response
+    pub keep_alive: bool,
     // query patch, cookies patch, rewrite_uri ...
 }
 
-impl FromLuaExact for OnRequestExpectHttpBodyResp {
+impl FromLuaExact for ForwardHttp {
     fn from_lua_exact(lua_value: LuaValue, _: &Lua) -> mlua::Result<Self> {
         match lua_value {
             LuaValue::UserData(ud) if ud.is::<Self>() => {
-                let resp: OnRequestExpectHttpBodyResp = ud.take::<Self>()?;
+                let resp: ForwardHttp = ud.take::<Self>()?;
                 Ok(resp)
             }
             _ => Err(LuaError::FromLuaConversionError {
                 from: lua_value.type_name(),
-                to: "OnAcceptExpectHttpResp".to_string(),
+                to: "ForwardHttp".to_string(),
                 message: Some("Expected a userdata".to_string()),
             }),
         }
     }
 }
-impl tealr::mlu::TealData for OnRequestExpectHttpBodyResp {
+impl tealr::mlu::TealData for ForwardHttp {
     fn add_methods<F: TealDataMethods<Self>>(methods: &mut F) {
         methods.add_method_mut("set_max_body_size", |_, this, size: usize| {
             this.max_body_size = size;
@@ -467,31 +470,36 @@ impl tealr::mlu::TealData for OnRequestExpectHttpBodyResp {
                 .remove_headers
                 .push(key);
             Ok(())
+        });
+
+        methods.add_method_mut("keep_alive", |_, this, val: bool| {
+            this.keep_alive = val;
+            Ok(())
         })
     }
 }
 
-create_union_mlua!(pub enum OnRequestResp = OnRequestExpectHttpBodyResp | OnAcceptDenyResp | OnAcceptRedirectResp);
+create_union_mlua!(pub enum OnRequestHandlerResp = ForwardHttp | Deny | Redirect);
 
-impl std::fmt::Debug for OnRequestResp {
+impl std::fmt::Debug for OnRequestHandlerResp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            OnRequestResp::OnRequestExpectHttpBodyResp(x) => f
-                .debug_tuple("OnRequestExpectHttpBodyResp")
+            OnRequestHandlerResp::ForwardHttp(x) => f
+                .debug_tuple("ForwardHttp")
                 .field(x)
                 .finish(),
-            OnRequestResp::OnAcceptDenyResp(x) => {
-                f.debug_tuple("OnAcceptDenyResp").field(x).finish()
+            OnRequestHandlerResp::Deny(x) => {
+                f.debug_tuple("Deny").field(x).finish()
             }
-            OnRequestResp::OnAcceptRedirectResp(x) => {
-                f.debug_tuple("OnAcceptRedirectResp").field(x).finish()
+            OnRequestHandlerResp::Redirect(x) => {
+                f.debug_tuple("Redirect").field(x).finish()
             }
         }
     }
 }
 
-pub type OnAcceptFn = TypedFunction<ClientHandle, OnAcceptResp>;
-pub type OnRequestFn = TypedFunction<(ClientHandle, RequestHandle), OnRequestResp>;
+pub type OnAcceptFn = TypedFunction<ClientHandle, OnAcceptHandlerResp>;
+pub type OnRequestFn = TypedFunction<(ClientHandle, RequestHandle), OnRequestHandlerResp>;
 
 #[derive(Debug)]
 pub struct CachedValue<T> {
@@ -542,10 +550,8 @@ impl FromLua for CacheParam {
 
 pub type HandlerMap = Rc<RefCell<HashMap<Box<str>, LuaFunction>>>;
 pub type OnAcceptFnSlot = Rc<RefCell<Option<LuaFunction>>>;
-pub type KeepAliveFlag = Rc<Cell<bool>>;
 #[derive(Debug, tealr::mlu::UserData, ToTypename)]
 pub struct Proxy {
-    pub keep_alive: KeepAliveFlag,
     pub on_accept_fn: OnAcceptFnSlot,
     pub req_handlers: HandlerMap,
     pub listen_addr: Box<str>,
@@ -553,9 +559,8 @@ pub struct Proxy {
 }
 
 impl Proxy {
-    fn new(on_accept_fn: OnAcceptFnSlot, req_handlers: HandlerMap, listen_addr: String, keep_alive: KeepAliveFlag) -> Self {
+    fn new(on_accept_fn: OnAcceptFnSlot, req_handlers: HandlerMap, listen_addr: String) -> Self {
         Self {
-            keep_alive,
             on_accept_fn,
             req_handlers,
             listen_addr: listen_addr.into(),
@@ -571,15 +576,9 @@ impl TealData for Proxy {
             Ok(())
         });
 
-        // on by default;
-        // do we honour client keep-alive or not?
-        methods.add_method("keep_alive", |_, this, on: bool| {
-            this.keep_alive.set(on);
-            Ok(())
-        });
-
-        methods.add_method_mut("cached_call", |_, this, (cache_info, func, args): (CacheParam, LuaFunction, LuaVariadic<LuaValue>)| {
-            let cached =  this.cached_results.get(&cache_info.key);
+        methods.add_method_mut("cached_call", |_, this, (host, cache_info, func, args): (String, CacheParam, LuaFunction, LuaVariadic<LuaValue>)| {
+            let key = host.clone() + &cache_info.key;
+            let cached =  this.cached_results.get(key.as_str());
             if let Some(cached) = cached && let Some(val) = cached.get() {
                 return val.clone();
             }
@@ -608,21 +607,22 @@ impl TealData for Proxy {
             Ok(())
         });
 
-        methods.add_method("resp_expect_httpbody", |_lua, _, upstream: String| {
-            let resp = OnRequestExpectHttpBodyResp {
+        methods.add_method("forward_http", |_lua, _, upstream: String| {
+            let resp = ForwardHttp {
                 upstream,
                 max_body_size: 1048576,
                 proxy_read_timeout: Some(30),
                 client_body_timeout: Some(30),
                 cache: None,
                 headers_patch: None,
+                keep_alive: true,
             };
             Ok(resp)
             //lua.create_userdata(resp)
         });
 
-        methods.add_method("resp_expect_http", |_lua, _, _: ()| {
-            let resp = OnAcceptExpectHttpResp {
+        methods.add_method("expect_http", |_lua, _, _: ()| {
+            let resp = ExpectHttp {
                 max_header_size: 8192,
                 max_header_count: 64,
                 expected_method: "".into(),
@@ -635,17 +635,17 @@ impl TealData for Proxy {
             Ok(resp)
         });
 
-        methods.add_method("resp_deny", |_lua, _, reason: String| {
-            let resp = OnAcceptDenyResp {
+        methods.add_method("deny", |_lua, _, reason: String| {
+            let resp = Deny {
                 reason: reason.into(),
             };
             Ok(resp)
         });
 
         methods.add_method(
-            "resp_redirect",
+            "redirect",
             |_lua, _, (status, location): (u16, String)| {
-                let resp = OnAcceptRedirectResp {
+                let resp = Redirect {
                     status,
                     location: location.into(),
                 };
@@ -657,7 +657,6 @@ impl TealData for Proxy {
 
 pub struct LuaConf {
     pub lua: Lua,
-    pub keep_alive: KeepAliveFlag,
     pub req_handlers: HandlerMap,
     pub on_accept_fn: OnAcceptFnSlot,
     pub pool: HandlePool,
@@ -667,9 +666,8 @@ impl LuaConf {
     pub fn new(pool_size: usize) -> Result<Self, LuaError> {
         let req_handlers: HandlerMap = Rc::new(RefCell::new(HashMap::new()));
         let on_accept_fn: OnAcceptFnSlot = Rc::new(RefCell::new(None));
-        let keep_alive: KeepAliveFlag = Rc::new(Cell::new(true));
 
-        let proxy = Proxy::new(on_accept_fn.clone(), req_handlers.clone(), "".into(), keep_alive.clone());
+        let proxy = Proxy::new(on_accept_fn.clone(), req_handlers.clone(), "".into());
         let lua = Lua::new();
 
         // reusing handles means lua allocates so little that the default incremental
@@ -683,7 +681,6 @@ impl LuaConf {
 
         Ok(LuaConf {
             lua,
-            keep_alive,
             req_handlers,
             on_accept_fn,
             pool: handles_pool,
@@ -712,26 +709,26 @@ mod tests {
             proxy:on_request("example.com", function(client, req)
                 print("Request from", client.ip, client.port)
                 print(req.method, req.path)
-                resp = proxy:resp_expect_httpbody("127.0.0.1:8000")
-                resp:set_cache(60, "$url")
-                return resp
+                handler_resp = proxy:forward_http("127.0.0.1:8000")
+                handler_resp:set_cache(60, "$url")
+                return handler_resp
             end)
 
             proxy:on_accept(function(client)
                 print("Accepted connection from", client.ip, client.port)
                 if client.ip == "10.100.1.1" then
-                    local resp = proxy:resp_expect_http()
-                    resp:set_max_header_size(16384)
-                    resp:set_max_header_count(128)
-                    resp:set_expected_method("GET")
-                    resp:set_tls("/path/to/keyfile")
-                    return resp
+                    local handler_resp = proxy:expect_http()
+                    handler_resp:set_max_header_size(16384)
+                    handler_resp:set_max_header_count(128)
+                    handler_resp:set_expected_method("GET")
+                    handler_resp:set_tls("/path/to/keyfile")
+                    return handler_resp
 
                 elseif client.ip == "127.0.0.1" then
-                    return proxy:resp_redirect(201, "https://example.com")
+                    return proxy:redirect(201, "https://example.com")
 
                 else
-                    return proxy:resp_deny("NOPE")
+                    return proxy:deny("NOPE")
                 end
             end)
         "#,
@@ -749,7 +746,7 @@ mod tests {
             .borrow()
             .as_ref()
             .unwrap()
-            .call::<OnAcceptResp>(&handle_ud.client_ud)?;
+            .call::<OnAcceptHandlerResp>(&handle_ud.client_ud)?;
         println!("{:?}", resp);
 
         handle_ud.set_client(client2.clone());
@@ -758,7 +755,7 @@ mod tests {
             .borrow()
             .as_ref()
             .unwrap()
-            .call::<OnAcceptResp>(&handle_ud.client_ud)?;
+            .call::<OnAcceptHandlerResp>(&handle_ud.client_ud)?;
         println!("{:?}", resp);
 
         handle_ud.set_client(client3.clone());
@@ -767,7 +764,7 @@ mod tests {
             .borrow()
             .as_ref()
             .unwrap()
-            .call::<OnAcceptResp>(&handle_ud.client_ud)?;
+            .call::<OnAcceptHandlerResp>(&handle_ud.client_ud)?;
         println!("{:?}", resp);
 
         println!();
@@ -780,7 +777,7 @@ mod tests {
             .borrow()
             .get("example.com")
             .unwrap()
-            .call::<OnRequestResp>((&handle_ud.client_ud, &handle_ud.req_ud));
+            .call::<OnRequestHandlerResp>((&handle_ud.client_ud, &handle_ud.req_ud));
         println!("{:?}", resp);
 
         Ok(())

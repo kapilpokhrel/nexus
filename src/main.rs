@@ -6,8 +6,8 @@ mod resolve;
 mod session;
 
 use crate::lua_config::{
-    CacheParam, ClientHandle, LuaConf, OnAcceptDenyResp, OnAcceptExpectHttpResp,
-    OnAcceptRedirectResp, OnRequestExpectHttpBodyResp, Proxy, RequestHandle,
+    CacheParam, ClientHandle, LuaConf, Deny, ExpectHttp,
+    Redirect, ForwardHttp, Proxy, RequestHandle,
 };
 use mlua::prelude::*;
 use monoio::net::TcpListener;
@@ -26,10 +26,10 @@ async fn main() {
         .process_type::<CacheParam>()
         .process_type::<ClientHandle>()
         .process_type::<RequestHandle>()
-        .process_type::<OnAcceptExpectHttpResp>()
-        .process_type::<OnAcceptDenyResp>()
-        .process_type::<OnAcceptRedirectResp>()
-        .process_type::<OnRequestExpectHttpBodyResp>();
+        .process_type::<ExpectHttp>()
+        .process_type::<Deny>()
+        .process_type::<Redirect>()
+        .process_type::<ForwardHttp>();
 
     let json = types.to_json().unwrap();
     if fs::write("conduit.json", json).is_err() {
