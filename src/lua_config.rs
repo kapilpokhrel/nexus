@@ -1,506 +1,21 @@
 use mlua::prelude::*;
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::net::IpAddr;
-use std::ops::Range;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::{cell::Cell, cell::RefCell, fmt::Debug};
-use tealr::mlu::{FromLuaExact, TealData, TealDataMethods, TypedFunction};
-use tealr::{ToTypename, create_union_mlua};
+use tealr::ToTypename;
+use tealr::mlu::{TealData, TealDataMethods};
 
-#[derive(Clone)]
-pub struct OnRequestParamSlot {
-    pub client: Option<Client>,
-    pub req: Option<Request>,
-}
+mod handler_response;
+mod handles;
 
-macro_rules! teal_name {
-    ($t:ty, $n:literal) => {
-        impl ToTypename for $t {
-            fn to_typename() -> tealr::Type {
-                tealr::Type::new_single($n, tealr::KindOfType::External)
-            }
-        }
-    };
-}
-
-pub struct OnRequestHandleUDs {
-    slot: Rc<RefCell<OnRequestParamSlot>>,
-    pub client_ud: LuaAnyUserData,
-    pub req_ud: LuaAnyUserData,
-}
-
-impl OnRequestHandleUDs {
-    pub fn new(lua: &Lua, slot: Rc<RefCell<OnRequestParamSlot>>) -> Self {
-        let client_ud = lua.create_userdata(ClientHandle(slot.clone())).unwrap();
-        let req_ud = lua.create_userdata(RequestHandle(slot.clone())).unwrap();
-        Self {
-            slot,
-            client_ud,
-            req_ud,
-        }
-    }
-
-    pub fn set_client(&self, client: Client) {
-        self.slot.borrow_mut().client = Some(client);
-    }
-
-    pub fn set_req(&self, req: Request) {
-        self.slot.borrow_mut().req = Some(req);
-    }
-
-    pub fn clear(&self) {
-        self.slot.borrow_mut().client = None;
-        self.slot.borrow_mut().req = None;
-    }
-}
-
-pub struct HandlePool {
-    lua: Lua,
-    pool: Vec<Rc<OnRequestHandleUDs>>,
-}
-
-impl HandlePool {
-    pub fn new(lua: Lua, pool_size: usize) -> Self {
-        let mut pool = Vec::with_capacity(pool_size);
-        for _ in 0..pool_size {
-            let slot = Rc::new(RefCell::new(OnRequestParamSlot {
-                client: None,
-                req: None,
-            }));
-            pool.push(Rc::new(OnRequestHandleUDs::new(&lua, slot)));
-        }
-        Self { lua, pool }
-    }
-
-    pub fn checkout(&self) -> Rc<OnRequestHandleUDs> {
-        for uds in &self.pool {
-            if Rc::strong_count(uds) == 1 {
-                uds.clear();
-                return uds.clone();
-            }
-        }
-        //no free entry: this request gets its own, which is dropped rather than pooled
-        let slot = Rc::new(RefCell::new(OnRequestParamSlot {
-            client: None,
-            req: None,
-        }));
-        Rc::new(OnRequestHandleUDs::new(&self.lua, slot))
-    }
-}
-
-pub struct ClientInner {
-    pub ip: IpAddr,
-    pub port: u16,
-}
-
-#[derive(Clone)]
-pub struct Client(pub Arc<ClientInner>);
-
-impl Client {
-    pub fn new(ip: IpAddr, port: u16) -> Self {
-        Self(Arc::new(ClientInner { ip, port }))
-    }
-}
-
-#[derive(tealr::mlu::UserData)]
-pub struct ClientHandle(pub Rc<RefCell<OnRequestParamSlot>>);
-teal_name!(ClientHandle, "Client");
-
-impl tealr::mlu::TealData for ClientHandle {
-    fn add_fields<F: tealr::mlu::TealDataFields<Self>>(fields: &mut F) {
-        fields.add_field_method_get("ip", |lua, this| {
-            lua.create_string(this.0.borrow().client.as_ref().unwrap().0.ip.to_string())
-        });
-        fields.add_field_method_get("port", |_, this| {
-            Ok(this.0.borrow().client.as_ref().unwrap().0.port)
-        });
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct OnAcceptTlsBlock {
-    pub enabled: bool,
-    pub keyfile: Box<str>,
-}
-
-#[derive(Debug, Clone, tealr::mlu::UserData, ToTypename)]
-pub struct ExpectHttp {
-    pub max_header_size: usize,
-    pub max_header_count: usize,
-    pub expected_method: Box<str>,
-    pub header_timeout: u64,
-    pub tls: OnAcceptTlsBlock,
-}
-
-impl FromLuaExact for ExpectHttp {
-    fn from_lua_exact(lua_value: LuaValue, _lua: &Lua) -> LuaResult<Self> {
-        match lua_value {
-            LuaValue::UserData(ud) if ud.is::<Self>() => {
-                let resp: ExpectHttp = ud.take::<Self>()?;
-                Ok(resp)
-            }
-            _ => Err(LuaError::FromLuaConversionError {
-                from: lua_value.type_name(),
-                to: "ExpectHttp".to_string(),
-                message: Some("Expected a userdata with 'max_header_size', 'max_header_count', 'expected_method', 'header_timeout', and 'tls' fields".to_string()),
-            }),
-        }
-    }
-}
-
-impl tealr::mlu::TealData for ExpectHttp {
-    fn add_methods<F: tealr::mlu::TealDataMethods<Self>>(fields: &mut F) {
-        fields.add_method_mut("set_max_header_size", |_, this, size: usize| {
-            this.max_header_size = size;
-            Ok(())
-        });
-        fields.add_method_mut("set_max_header_count", |_, this, count: usize| {
-            this.max_header_count = count;
-            Ok(())
-        });
-        fields.add_method_mut("set_header_timeout", |_, this, timeout: u64| {
-            this.header_timeout = timeout;
-            Ok(())
-        });
-        fields.add_method_mut("set_expected_method", |_, this, method: String| {
-            this.expected_method = method.into();
-            Ok(())
-        });
-        fields.add_method_mut("set_tls", |_, this, tls_keyfile: String| {
-            this.tls = OnAcceptTlsBlock {
-                enabled: true,
-                keyfile: tls_keyfile.into(),
-            };
-            Ok(())
-        });
-    }
-}
-
-#[derive(Debug, Clone, tealr::mlu::UserData, ToTypename)]
-pub struct Deny {
-    pub reason: Box<str>,
-}
-
-impl TealData for Deny {
-    fn add_fields<F: tealr::mlu::TealDataFields<Self>>(fields: &mut F) {
-        fields.add_field_method_get("reason", |lua, this| {
-            lua.create_string(this.reason.to_string())
-        });
-    }
-}
-
-impl FromLuaExact for Deny {
-    fn from_lua_exact(lua_value: LuaValue, _lua: &Lua) -> LuaResult<Self> {
-        match lua_value {
-            LuaValue::UserData(ud) if ud.is::<Self>() => {
-                let resp: Deny = ud.take::<Self>()?;
-                Ok(resp)
-            }
-            _ => Err(LuaError::FromLuaConversionError {
-                from: lua_value.type_name(),
-                to: "Deny".to_string(),
-                message: Some("Expected a userdata with 'reason' field".to_string()),
-            }),
-        }
-    }
-}
-
-#[derive(Debug, Clone, tealr::mlu::UserData, ToTypename)]
-pub struct Redirect {
-    pub status: u16,
-    pub location: Box<str>,
-}
-
-impl tealr::mlu::TealData for Redirect {
-    fn add_fields<F: tealr::mlu::TealDataFields<Self>>(fields: &mut F) {
-        fields.add_field_method_get("status", |_lua, this| Ok(this.status));
-        fields.add_field_method_get("location", |lua, this| {
-            lua.create_string(this.location.to_string())
-        });
-    }
-}
-
-impl FromLuaExact for Redirect {
-    fn from_lua_exact(lua_value: LuaValue, _lua: &Lua) -> LuaResult<Self> {
-        match lua_value {
-            LuaValue::UserData(ud) if ud.is::<Self>() => {
-                let resp: Redirect = ud.take::<Self>()?;
-                Ok(resp)
-            }
-            _ => Err(LuaError::FromLuaConversionError {
-                from: lua_value.type_name(),
-                to: "Redirect".to_string(),
-                message: Some(
-                    "Expected a userdata with 'status' and 'location' fields".to_string(),
-                ),
-            }),
-        }
-    }
-}
-
-create_union_mlua!(pub enum OnAcceptHandlerResp = Deny | Redirect | ExpectHttp);
-
-impl std::fmt::Debug for OnAcceptHandlerResp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            OnAcceptHandlerResp::ExpectHttp(x) => {
-                f.debug_tuple("ExpectHttp").field(x).finish()
-            }
-            OnAcceptHandlerResp::Deny(x) => {
-                f.debug_tuple("Deny").field(x).finish()
-            }
-            OnAcceptHandlerResp::Redirect(x) => {
-                f.debug_tuple("Redirect").field(x).finish()
-            }
-        }
-    }
-}
+pub use handler_response::{
+    Deny, ExpectHttp, ForwardHttp, OnAcceptFn, OnAcceptHandlerResp, OnAcceptTlsBlock, OnRequestFn,
+    OnRequestHandlerResp, Redirect
+};
+pub use handles::{Client, ClientHandle, HandlePool, Request, RequestHandle};
 
 tealr::create_generic_mlua!(X);
-
-#[derive(Debug)]
-pub struct RequestInner {
-    head: Box<[u8]>,
-    method: Range<usize>,
-    path: Range<usize>,
-    headers: Vec<(Range<usize>, Range<usize>)>,
-}
-
-impl RequestInner {
-    #[inline]
-    fn at(&self, r: &Range<usize>) -> &str {
-        unsafe { std::str::from_utf8_unchecked(&self.head[r.clone()]) }
-    }
-
-    pub fn method(&self) -> &str {
-        self.at(&self.method)
-    }
-
-    pub fn path(&self) -> &str {
-        self.at(&self.path)
-    }
-
-    pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(n, _)| self.at(n) == name)
-            .map(|(_, v)| self.at(v))
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.headers.iter().map(|(n, v)| (self.at(n), self.at(v)))
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct Request(pub Arc<RequestInner>);
-
-impl Request {
-    /// `head` is the request header directly read from the socket; the ranges are
-    /// offsets into it
-    pub fn new(
-        head: &[u8],
-        method: Range<usize>,
-        path: Range<usize>,
-        headers: Vec<(Range<usize>, Range<usize>)>,
-    ) -> Self {
-        Self(Arc::new(RequestInner {
-            head: head.into(),
-            method,
-            path,
-            headers,
-        }))
-    }
-
-    /// For tests
-    pub fn from_parts(method: &str, path: &str, headers: &[(&str, &str)]) -> Self {
-        let mut head = Vec::new();
-        head.extend_from_slice(method.as_bytes());
-        let m = 0..head.len();
-        head.push(b' ');
-        let p_start = head.len();
-        head.extend_from_slice(path.as_bytes());
-        let p = p_start..head.len();
-        head.extend_from_slice(b" HTTP/1.1\r\n");
-        let mut hs = Vec::with_capacity(headers.len());
-        for (n, v) in headers {
-            let n_start = head.len();
-            head.extend_from_slice(n.as_bytes());
-            let nr = n_start..head.len();
-            head.extend_from_slice(b": ");
-            let v_start = head.len();
-            head.extend_from_slice(v.as_bytes());
-            hs.push((nr, v_start..head.len()));
-            head.extend_from_slice(b"\r\n");
-        }
-        Request::new(&head, m, p, hs)
-    }
-}
-
-#[derive(tealr::mlu::UserData)]
-pub struct RequestHandle(pub Rc<RefCell<OnRequestParamSlot>>);
-teal_name!(RequestHandle, "Request");
-
-impl tealr::mlu::TealData for RequestHandle {
-    fn add_fields<F: tealr::mlu::TealDataFields<Self>>(fields: &mut F) {
-        fields.add_field_method_get("method", |lua, this| {
-            lua.create_string(this.0.borrow().req.as_ref().unwrap().0.method())
-        });
-        fields.add_field_method_get("path", |lua, this| {
-            lua.create_string(this.0.borrow().req.as_ref().unwrap().0.path())
-        });
-        fields.add_field_method_get("headers", |lua, this| {
-            let table = lua.create_table()?;
-            for (k, v) in this.0.borrow().req.as_ref().unwrap().0.iter() {
-                table.set(k, v)?;
-            }
-            Ok(table)
-        });
-    }
-    fn add_methods<M: TealDataMethods<Self>>(methods: &mut M) {
-        methods.add_method("header", |_, this, h: String| {
-            Ok(this
-                .0
-                .borrow()
-                .req
-                .as_ref()
-                .unwrap()
-                .0
-                .header(&h)
-                .map(str::to_string))
-        });
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct RespCacheBlock {
-    pub enabled: bool,
-    pub ttl: u32,
-    pub key: Box<str>,
-}
-
-#[derive(Debug, Clone)]
-pub struct HeadersPatchBlock {
-    pub add_headers: Vec<(String, String)>,
-    pub remove_headers: Vec<String>,
-}
-
-impl HeadersPatchBlock {
-    fn empty() -> Self {
-        HeadersPatchBlock {
-            add_headers: Vec::new(),
-            remove_headers: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, tealr::mlu::UserData, ToTypename)]
-pub struct ForwardHttp {
-    pub upstream: String,
-    pub max_body_size: usize,
-    pub proxy_read_timeout: Option<u32>,
-    pub client_body_timeout: Option<u32>,
-    // bla bla bla
-    pub cache: Option<RespCacheBlock>,
-    pub headers_patch: Option<HeadersPatchBlock>,
-
-    // do we honour client keep-alive or not? if false, we close the connection after the response
-    pub keep_alive: bool,
-    // query patch, cookies patch, rewrite_uri ...
-}
-
-impl FromLuaExact for ForwardHttp {
-    fn from_lua_exact(lua_value: LuaValue, _: &Lua) -> mlua::Result<Self> {
-        match lua_value {
-            LuaValue::UserData(ud) if ud.is::<Self>() => {
-                let resp: ForwardHttp = ud.take::<Self>()?;
-                Ok(resp)
-            }
-            _ => Err(LuaError::FromLuaConversionError {
-                from: lua_value.type_name(),
-                to: "ForwardHttp".to_string(),
-                message: Some("Expected a userdata".to_string()),
-            }),
-        }
-    }
-}
-impl tealr::mlu::TealData for ForwardHttp {
-    fn add_methods<F: TealDataMethods<Self>>(methods: &mut F) {
-        methods.add_method_mut("set_max_body_size", |_, this, size: usize| {
-            this.max_body_size = size;
-            Ok(())
-        });
-        methods.add_method_mut("set_proxy_read_timeout", |_, this, timeout: Option<u32>| {
-            this.proxy_read_timeout = timeout;
-            Ok(())
-        });
-        methods.add_method_mut(
-            "set_client_body_timeout",
-            |_, this, timeout: Option<u32>| {
-                this.client_body_timeout = timeout;
-                Ok(())
-            },
-        );
-
-        methods.add_method_mut("set_cache", |_, this, (ttl, key): (u32, String)| {
-            this.cache = Some(RespCacheBlock {
-                enabled: true,
-                ttl,
-                key: key.into(),
-            });
-            Ok(())
-        });
-
-        methods.add_method_mut("add_header", |_, this, (key, val): (String, String)| {
-            let p = this
-                .headers_patch
-                .get_or_insert_with(HeadersPatchBlock::empty);
-            match p.add_headers.iter_mut().find(|(k, _)| *k == key) {
-                Some(entry) => entry.1 = val,
-                None => p.add_headers.push((key, val)),
-            }
-            Ok(())
-        });
-
-        methods.add_method_mut("remove_header", |_, this, key: String| {
-            this.headers_patch
-                .get_or_insert_with(HeadersPatchBlock::empty)
-                .remove_headers
-                .push(key);
-            Ok(())
-        });
-
-        methods.add_method_mut("keep_alive", |_, this, val: bool| {
-            this.keep_alive = val;
-            Ok(())
-        })
-    }
-}
-
-create_union_mlua!(pub enum OnRequestHandlerResp = ForwardHttp | Deny | Redirect);
-
-impl std::fmt::Debug for OnRequestHandlerResp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            OnRequestHandlerResp::ForwardHttp(x) => f
-                .debug_tuple("ForwardHttp")
-                .field(x)
-                .finish(),
-            OnRequestHandlerResp::Deny(x) => {
-                f.debug_tuple("Deny").field(x).finish()
-            }
-            OnRequestHandlerResp::Redirect(x) => {
-                f.debug_tuple("Redirect").field(x).finish()
-            }
-        }
-    }
-}
-
-pub type OnAcceptFn = TypedFunction<ClientHandle, OnAcceptHandlerResp>;
-pub type OnRequestFn = TypedFunction<(ClientHandle, RequestHandle), OnRequestHandlerResp>;
-
 #[derive(Debug)]
 pub struct CachedValue<T> {
     value: T,
@@ -547,7 +62,6 @@ impl FromLua for CacheParam {
     }
 }
 
-
 pub type HandlerMap = Rc<RefCell<HashMap<Box<str>, LuaFunction>>>;
 pub type OnAcceptFnSlot = Rc<RefCell<Option<LuaFunction>>>;
 #[derive(Debug, tealr::mlu::UserData, ToTypename)]
@@ -564,7 +78,7 @@ impl Proxy {
             on_accept_fn,
             req_handlers,
             listen_addr: listen_addr.into(),
-            cached_results: HashMap::new()
+            cached_results: HashMap::new(),
         }
     }
 }
@@ -576,16 +90,31 @@ impl TealData for Proxy {
             Ok(())
         });
 
-        methods.add_method_mut("cached_call", |_, this, (host, cache_info, func, args): (String, CacheParam, LuaFunction, LuaVariadic<LuaValue>)| {
-            let key = host.clone() + &cache_info.key;
-            let cached =  this.cached_results.get(key.as_str());
-            if let Some(cached) = cached && let Some(val) = cached.get() {
-                return val.clone();
-            }
-            let retval = func.call::<LuaValue>(args);
-            this.cached_results.insert(cache_info.key.clone(), CachedValue::new(retval.clone(), cache_info.ttl));
-            retval
-        });
+        methods.add_method_mut(
+            "cached_call",
+            |_,
+             this,
+             (host, cache_info, func, args): (
+                String,
+                CacheParam,
+                LuaFunction,
+                LuaVariadic<LuaValue>,
+            )| {
+                let key = host.clone() + &cache_info.key;
+                let cached = this.cached_results.get(key.as_str());
+                if let Some(cached) = cached
+                    && let Some(val) = cached.get()
+                {
+                    return val.clone();
+                }
+                let retval = func.call::<LuaValue>(args);
+                this.cached_results.insert(
+                    key.into(),
+                    CachedValue::new(retval.clone(), cache_info.ttl),
+                );
+                retval
+            },
+        );
 
         methods.add_method_mut(
             "cache_param",
@@ -642,16 +171,13 @@ impl TealData for Proxy {
             Ok(resp)
         });
 
-        methods.add_method(
-            "redirect",
-            |_lua, _, (status, location): (u16, String)| {
-                let resp = Redirect {
-                    status,
-                    location: location.into(),
-                };
-                Ok(resp)
-            },
-        );
+        methods.add_method("redirect", |_lua, _, (status, location): (u16, String)| {
+            let resp = Redirect {
+                status,
+                location: location.into(),
+            };
+            Ok(resp)
+        });
     }
 }
 

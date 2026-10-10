@@ -12,7 +12,7 @@ let call_lua_fn = || {
     h.set_ctx(context.clone());
 
     lua_fn
-        .call::<OnRequestResp>((&h.client_ud, &h.req_ud, &h.ctx_ud))
+        .call::<OnRequestHandlerResp>((&h.client_ud, &h.req_ud, &h.ctx_ud))
         .unwrap()
 };
 ```

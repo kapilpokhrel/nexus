@@ -6,8 +6,8 @@ mod resolve;
 mod session;
 
 use crate::lua_config::{
-    CacheParam, ClientHandle, LuaConf, Deny, ExpectHttp,
-    Redirect, ForwardHttp, Proxy, RequestHandle,
+    CacheParam, ClientHandle, Deny, ExpectHttp, ForwardHttp, LuaConf, Proxy, Redirect,
+    RequestHandle,
 };
 use mlua::prelude::*;
 use monoio::net::TcpListener;

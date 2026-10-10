@@ -38,8 +38,7 @@ pub async fn forward_http(
 
         // decide upstream
         let (backend_addr, header_add_vec, client_keepalive_setting) =
-            resolve::resolve_backend(host, client_t.clone(), req, &state)
-                .await?;
+            resolve::resolve_backend(host, client_t.clone(), req, &state).await?;
 
         // check out upstream connection
         let mut backend = net::get_conn(&backend_addr).await?;
@@ -47,7 +46,8 @@ pub async fn forward_http(
         // relay request head + body
         let in_buf = read_len.saturating_sub(head.header_offset);
         buf = if let Some(n) = head.content_len {
-            let b = write_request_head(buf, &mut backend, &head, header_add_vec, in_buf.min(n)).await?;
+            let b =
+                write_request_head(buf, &mut backend, &head, header_add_vec, in_buf.min(n)).await?;
             send_n(b, &mut client, &mut backend, n.saturating_sub(in_buf)).await?
         } else if head.chunked {
             // relay_chunked starts at header_offset, so the head is written alone here
@@ -75,7 +75,12 @@ pub async fn forward_http(
             // all) of the body alongside the headers; it goes out with the head
             let in_buf = read_len.saturating_sub(head.header_offset);
             let b = write_response_head(
-                buf, &mut client, &head, &hdr_buf, client_keepalive, in_buf.min(n),
+                buf,
+                &mut client,
+                &head,
+                &hdr_buf,
+                client_keepalive,
+                in_buf.min(n),
             )
             .await?;
             buf = send_n(b, &mut backend, &mut client, n.saturating_sub(in_buf)).await?;

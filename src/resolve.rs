@@ -1,6 +1,4 @@
-use crate::lua_config::{
-    Client, LuaConf, OnAcceptHandlerResp, OnRequestHandlerResp, Request,
-};
+use crate::lua_config::{Client, LuaConf, OnAcceptHandlerResp, OnRequestHandlerResp, Request};
 use mlua::prelude::*;
 use std::io;
 
@@ -60,7 +58,11 @@ pub async fn resolve_backend(
 
     let handle_resp = |resp: OnRequestHandlerResp| {
         if let OnRequestHandlerResp::ForwardHttp(b) = resp {
-            Ok((b.upstream, b.headers_patch.map(|p| p.add_headers), b.keep_alive))
+            Ok((
+                b.upstream,
+                b.headers_patch.map(|p| p.add_headers),
+                b.keep_alive,
+            ))
         } else {
             Err(io::Error::new(
                 io::ErrorKind::InvalidData,
