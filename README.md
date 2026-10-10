@@ -60,7 +60,7 @@ end)
 ```
 - **`on_request`** will be called after parsing the request http with client and request information. It decides where to send this request (upstream) and it can do some request bending as well if needed.
 ```lua
-proxy:on_request("example.com", function(client, req, context)
+proxy:on_request("example.com", function(client, req)
     resp = proxy:resp_expect_httpbody("127.0.0.1:8000")
     resp:add_header("X_PROXY", "CONDUIT")
     return resp
@@ -70,7 +70,7 @@ end)
 All this and other setting will go in `config.lua` as
 ```lua
 -- proxy:on_accept skipped
-proxy:on_request("example.com", function(client, req, context)
+proxy:on_request("example.com", function(client, req)
     resp = proxy:resp_expect_httpbody("127.0.0.1:8000")
     resp:add_header("X_GREETING", "HELLO")
     return resp
@@ -78,46 +78,6 @@ end)
 
 proxy:keep_alive(false)
 proxy:listen_on("127.0.0.1:5000")
-```
-
-### Hooks/Modules
-
-Hooks are modules are piece of lua code that runs between `on_accept` and `on_request`. They can only add context for `on_request` to see. They can be added in plug-and-play fashion in modules.
-
-For example, this is `iploc` module which inserts short country code for each ip in context and then `on_request` can use it later.
-
-Hook/Module can only add on context, not read and `on_request` can only read from context.
-
-```
-modules
-├─ iploc
-|  ├─ manifest.toml
-|  └─ main.lua
-└─ ...
-```
-
-```toml
-# manifest.toml
-/*it needs to list all the things it requires. (It is just an experimentation on trying to sandbox and control what it can import; currently it does nothing xd)*/
-
-name="blessing"
-requires=[]
-```
-
-```lua
--- main.lua
-
--- https://www.ip2location.com/documentation/ip2location-libraries/lua/get-started
-
-ip2location = require('ip2location')
-local ip2loc = ip2location:new('/home/kapil/IP2LOCATION-LITE-DB1.BIN')
-
-iploc:add_incomming_hook(function(client, req)
-    local result = ip2loc:get_all(client.ip)
-    local resp = iploc:resp_update_ctx()
-    resp:add_to_ctx("country", result.country_short)
-    return resp
-end)
 ```
 
 ## Docs

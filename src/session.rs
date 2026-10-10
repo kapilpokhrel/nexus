@@ -1,6 +1,5 @@
 use crate::http::{self, MAX_HEADERS};
-use crate::lua_config::{Client, Context, LuaConf};
-use crate::lua_module::ProxyModuleTable;
+use crate::lua_config::{Client, LuaConf};
 use crate::net;
 use crate::relay::{fwd, relay_chunked, send_n, write_request_head, write_response_head};
 use crate::resolve;
@@ -15,7 +14,6 @@ pub async fn forward_http(
     mut client: TcpStream,
     peer_addr: SocketAddr,
     state: Rc<LuaConf>,
-    module_table: Rc<ProxyModuleTable>,
 ) -> io::Result<()> {
     let mut buf = vec![0u8; 8 * 1024];
     let mut hdr_buf: [MaybeUninit<(Range<usize>, Range<usize>)>; MAX_HEADERS] =
@@ -34,15 +32,13 @@ pub async fn forward_http(
             http::read_headers(buf, &mut client, &mut hdr_buf[..]).await?;
         buf = b;
 
-        let context = Context::new();
-
         // build host + Request view
         let (host, req) = http::host_and_request(&buf, &hdr_buf, &head, &req_line);
         let keep_alive_requested = http::client_wants_keep_alive(&buf, &req_line, &req);
 
         // decide upstream
         let (backend_addr, header_add_vec) =
-            resolve::resolve_backend(host, client_t.clone(), req, context, &state, &module_table)
+            resolve::resolve_backend(host, client_t.clone(), req, &state)
                 .await?;
 
         // check out upstream connection

@@ -1,16 +1,14 @@
 mod http;
 mod lua_config;
-mod lua_module;
 mod net;
 mod relay;
 mod resolve;
 mod session;
 
 use crate::lua_config::{
-    Cacheability, ClientHandle, ContextHandle, LuaConf, OnAcceptDenyResp, OnAcceptExpectHttpResp,
+    CacheParam, ClientHandle, LuaConf, OnAcceptDenyResp, OnAcceptExpectHttpResp,
     OnAcceptRedirectResp, OnRequestExpectHttpBodyResp, Proxy, RequestHandle,
 };
-use crate::lua_module::ProxyModuleTable;
 use mlua::prelude::*;
 use monoio::net::TcpListener;
 use std::fs;
@@ -25,10 +23,9 @@ pub const CONF_POOL_SIZE: usize = 8;
 async fn main() {
     let types = TypeWalker::new()
         .process_type::<Proxy>()
-        .process_type::<Cacheability>()
+        .process_type::<CacheParam>()
         .process_type::<ClientHandle>()
         .process_type::<RequestHandle>()
-        .process_type::<ContextHandle>()
         .process_type::<OnAcceptExpectHttpResp>()
         .process_type::<OnAcceptDenyResp>()
         .process_type::<OnAcceptRedirectResp>()
@@ -41,9 +38,7 @@ async fn main() {
 
     let conf_source = fs::read("config.lua").unwrap();
 
-    let module_table = Rc::new(ProxyModuleTable::new().unwrap());
     let state = Rc::new(LuaConf::new(CONF_POOL_SIZE).unwrap());
-
     let source = state.lua.load(str::from_utf8(&conf_source).unwrap());
     source.exec().unwrap();
 
@@ -67,9 +62,8 @@ async fn main() {
         };
         let _ = stream.set_nodelay(true);
         let state_pass = state.clone();
-        let module_table_pass = module_table.clone();
         monoio::spawn(async move {
-            let _r = session::forward_http(stream, peer_addr, state_pass, module_table_pass).await;
+            let _r = session::forward_http(stream, peer_addr, state_pass).await;
         });
     }
 }

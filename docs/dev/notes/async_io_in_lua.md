@@ -13,6 +13,22 @@ And that is exactly happens when our lua function if it calls something blocking
 
 Since the program state will goto lua side when we call a lua function, it can never yeild back to rust runtime.
 
+```lua
+local socket = require("socket")
+local BLOCKING = false
+
+local sleeptest = {}
+sleeptest.sleep = function(ms)
+    if BLOCKING then
+        socket.sleep(ms / 1000)
+    else
+        conduit.sleep(ms)
+    end
+end
+
+return sleeptest
+```
+
 To test that, i made a lua module that calls a socket:sleep inside a lua function and sleeps for 15ms. Lets see how devastating that is
 
 ![Concurrency Curve with sleeptest module (blocking)](pics/sleeptest_blocking.png)

@@ -1,3 +1,7 @@
+> [!NOTE]
+> This was before the removal of modules
+
+
 Modules don't recieve a context. They are independent, they only set a context
 
 **Why was this done?**

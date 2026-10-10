@@ -1,3 +1,6 @@
+> [!NOTE]
+> This was before the removal of modules
+
 As of today, 20th Augutst 2026, each lua state has a pool of handles (preinitialized lua userdata for lua fn parameters: `client`, `request`, `context`)
 and in each request, we checkout one handle from the pool, sets the inner value for `client`, `request`, `context` and call with already created userdata.
 

@@ -9,13 +9,10 @@ use std::{cell::Cell, cell::RefCell, fmt::Debug};
 use tealr::mlu::{FromLuaExact, TealData, TealDataMethods, TypedFunction};
 use tealr::{ToTypename, create_union_mlua};
 
-use crate::lua_module::HookResult;
-
 #[derive(Clone)]
 pub struct OnRequestParamSlot {
     pub client: Option<Client>,
     pub req: Option<Request>,
-    pub ctx: Option<Context>,
 }
 
 macro_rules! teal_name {
@@ -32,19 +29,16 @@ pub struct OnRequestHandleUDs {
     slot: Rc<RefCell<OnRequestParamSlot>>,
     pub client_ud: LuaAnyUserData,
     pub req_ud: LuaAnyUserData,
-    pub ctx_ud: LuaAnyUserData,
 }
 
 impl OnRequestHandleUDs {
     pub fn new(lua: &Lua, slot: Rc<RefCell<OnRequestParamSlot>>) -> Self {
         let client_ud = lua.create_userdata(ClientHandle(slot.clone())).unwrap();
         let req_ud = lua.create_userdata(RequestHandle(slot.clone())).unwrap();
-        let ctx_ud = lua.create_userdata(ContextHandle(slot.clone())).unwrap();
         Self {
             slot,
             client_ud,
             req_ud,
-            ctx_ud,
         }
     }
 
@@ -56,14 +50,9 @@ impl OnRequestHandleUDs {
         self.slot.borrow_mut().req = Some(req);
     }
 
-    pub fn set_ctx(&self, ctx: Context) {
-        self.slot.borrow_mut().ctx = Some(ctx);
-    }
-
     pub fn clear(&self) {
         self.slot.borrow_mut().client = None;
         self.slot.borrow_mut().req = None;
-        self.slot.borrow_mut().ctx = None;
     }
 }
 
@@ -79,7 +68,6 @@ impl HandlePool {
             let slot = Rc::new(RefCell::new(OnRequestParamSlot {
                 client: None,
                 req: None,
-                ctx: None,
             }));
             pool.push(Rc::new(OnRequestHandleUDs::new(&lua, slot)));
         }
@@ -97,7 +85,6 @@ impl HandlePool {
         let slot = Rc::new(RefCell::new(OnRequestParamSlot {
             client: None,
             req: None,
-            ctx: None,
         }));
         Rc::new(OnRequestHandleUDs::new(&self.lua, slot))
     }
@@ -272,52 +259,6 @@ impl std::fmt::Debug for OnAcceptResp {
 }
 
 tealr::create_generic_mlua!(X);
-
-#[derive(Debug)]
-pub struct ContextInner {
-    pub ctx: HashMap<Box<str>, X>,
-}
-
-#[derive(Clone, Debug)]
-pub struct Context(Arc<RefCell<ContextInner>>);
-
-impl Context {
-    pub fn new() -> Self {
-        Self(Arc::new(RefCell::new(ContextInner {
-            ctx: HashMap::new(),
-        })))
-    }
-
-    pub fn insert(&mut self, k: Box<str>, v: LuaValue) {
-        self.0.borrow_mut().ctx.insert(k, v.into());
-    }
-}
-
-#[derive(tealr::mlu::UserData)]
-pub struct ContextHandle(pub Rc<RefCell<OnRequestParamSlot>>);
-teal_name!(ContextHandle, "Context");
-
-impl tealr::mlu::TealData for ContextHandle {
-    fn add_methods<M: TealDataMethods<Self>>(methods: &mut M) {
-        methods.add_method("get", |_, this, key: String| {
-            if let Some(v) = this
-                .0
-                .borrow()
-                .ctx
-                .as_ref()
-                .unwrap()
-                .0
-                .borrow()
-                .ctx
-                .get::<Box<str>>(&key.into())
-            {
-                Ok(Some(v.clone()))
-            } else {
-                Ok(None)
-            }
-        });
-    }
-}
 
 #[derive(Debug)]
 pub struct RequestInner {
@@ -550,7 +491,7 @@ impl std::fmt::Debug for OnRequestResp {
 }
 
 pub type OnAcceptFn = TypedFunction<ClientHandle, OnAcceptResp>;
-pub type OnRequestFn = TypedFunction<(ClientHandle, RequestHandle, ContextHandle), OnRequestResp>;
+pub type OnRequestFn = TypedFunction<(ClientHandle, RequestHandle), OnRequestResp>;
 
 #[derive(Debug)]
 pub struct CachedValue<T> {
@@ -575,37 +516,23 @@ impl<T> CachedValue<T> {
     }
 }
 
-#[derive(Debug)]
-pub enum HookCacheKeyKind {
-    Url,
-    Ip,
-    Header(String),
-    Custom(String),
-}
-
-#[derive(Debug)]
-pub struct Hook {
-    pub name: String,
-    pub cacheability: Option<Cacheability>,
-    pub cached_result: HashMap<String, CachedValue<HookResult>>,
-}
-
 #[derive(Debug, tealr::mlu::UserData, ToTypename)]
-pub struct Cacheability {
+pub struct CacheParam {
     pub ttl: Duration,
-    pub key: HookCacheKeyKind,
+    pub key: Box<str>,
 }
-impl TealData for Cacheability {}
-impl FromLua for Cacheability {
+
+impl TealData for CacheParam {}
+impl FromLua for CacheParam {
     fn from_lua(lua_value: LuaValue, _: &Lua) -> LuaResult<Self> {
         match lua_value {
             LuaValue::UserData(ud) if ud.is::<Self>() => {
-                let resp: Cacheability = ud.take::<Self>()?;
+                let resp: CacheParam = ud.take::<Self>()?;
                 Ok(resp)
             }
             _ => Err(LuaError::FromLuaConversionError {
                 from: lua_value.type_name(),
-                to: "Cacheability".to_string(),
+                to: "CacheParam".to_string(),
                 message: Some("Expected a userdata".to_string()),
             }),
         }
@@ -615,15 +542,26 @@ impl FromLua for Cacheability {
 
 pub type HandlerMap = Rc<RefCell<HashMap<Box<str>, LuaFunction>>>;
 pub type OnAcceptFnSlot = Rc<RefCell<Option<LuaFunction>>>;
-pub type HooksMap = Rc<RefCell<HashMap<Box<str>, RefCell<Vec<Hook>>>>>;
 pub type KeepAliveFlag = Rc<Cell<bool>>;
 #[derive(Debug, tealr::mlu::UserData, ToTypename)]
 pub struct Proxy {
     pub keep_alive: KeepAliveFlag,
     pub on_accept_fn: OnAcceptFnSlot,
     pub req_handlers: HandlerMap,
-    pub hooks: HooksMap,
     pub listen_addr: Box<str>,
+    pub cached_results: HashMap<Box<str>, CachedValue<Result<LuaValue, LuaError>>>,
+}
+
+impl Proxy {
+    fn new(on_accept_fn: OnAcceptFnSlot, req_handlers: HandlerMap, listen_addr: String, keep_alive: KeepAliveFlag) -> Self {
+        Self {
+            keep_alive,
+            on_accept_fn,
+            req_handlers,
+            listen_addr: listen_addr.into(),
+            cached_results: HashMap::new()
+        }
+    }
 }
 
 impl TealData for Proxy {
@@ -640,47 +578,23 @@ impl TealData for Proxy {
             Ok(())
         });
 
-        methods.add_method_mut(
-            "cacheability",
-            |_, _this, (cache_ttl, cache_key): (u64, String)| {
-                let key = if cache_key == "$url" {
-                    HookCacheKeyKind::Url
-                } else if cache_key == "$ip" {
-                    HookCacheKeyKind::Ip
-                } else if cache_key.starts_with("$header:") {
-                    let header_name = cache_key.trim_start_matches("$header:").to_string();
-                    HookCacheKeyKind::Header(header_name)
-                } else {
-                    HookCacheKeyKind::Custom(cache_key)
-                };
-                Ok(Cacheability {
-                    ttl: Duration::from_secs(cache_ttl),
-                    key,
-                })
-            },
-        );
+        methods.add_method_mut("cached_call", |_, this, (cache_info, func, args): (CacheParam, LuaFunction, LuaVariadic<LuaValue>)| {
+            let cached =  this.cached_results.get(&cache_info.key);
+            if let Some(cached) = cached && let Some(val) = cached.get() {
+                return val.clone();
+            }
+            let retval = func.call::<LuaValue>(args);
+            this.cached_results.insert(cache_info.key.clone(), CachedValue::new(retval.clone(), cache_info.ttl));
+            retval
+        });
 
         methods.add_method_mut(
-            "register_hook",
-            |_, this, (host, module_name, cache_info): (String, String, Option<Cacheability>)| {
-                let key: Box<str> = host.into();
-                if !this.hooks.borrow().contains_key(&key) {
-                    this.hooks
-                        .borrow_mut()
-                        .insert(key.clone(), RefCell::new(Vec::new()));
-                }
-                let hook = Hook {
-                    name: module_name,
-                    cacheability: cache_info,
-                    cached_result: HashMap::new(),
-                };
-                this.hooks
-                    .borrow()
-                    .get(&key)
-                    .unwrap()
-                    .borrow_mut()
-                    .insert(0, hook);
-                Ok(())
+            "cache_param",
+            |_, _this, (cache_ttl, cache_key): (u64, String)| {
+                Ok(CacheParam {
+                    ttl: Duration::from_secs(cache_ttl),
+                    key: cache_key.into(),
+                })
             },
         );
 
@@ -689,10 +603,6 @@ impl TealData for Proxy {
             Ok(())
         });
 
-        //methods.add_method_mut("on_accept", |_, this, f: LuaFunction| {
-        //    this.on_accept_fn.replace(Some(f));
-        //    Ok(())
-        //});
         methods.add_method_mut("on_accept", |_, this, f: OnAcceptFn| {
             this.on_accept_fn.replace(Some(f.into()));
             Ok(())
@@ -750,7 +660,6 @@ pub struct LuaConf {
     pub keep_alive: KeepAliveFlag,
     pub req_handlers: HandlerMap,
     pub on_accept_fn: OnAcceptFnSlot,
-    pub hooks: HooksMap,
     pub pool: HandlePool,
 }
 
@@ -758,16 +667,9 @@ impl LuaConf {
     pub fn new(pool_size: usize) -> Result<Self, LuaError> {
         let req_handlers: HandlerMap = Rc::new(RefCell::new(HashMap::new()));
         let on_accept_fn: OnAcceptFnSlot = Rc::new(RefCell::new(None));
-        let hooks: HooksMap = Rc::new(RefCell::new(HashMap::new()));
         let keep_alive: KeepAliveFlag = Rc::new(Cell::new(true));
 
-        let proxy = Proxy {
-            keep_alive: keep_alive.clone(),
-            req_handlers: req_handlers.clone(),
-            on_accept_fn: on_accept_fn.clone(),
-            listen_addr: "".into(),
-            hooks: hooks.clone(),
-        };
+        let proxy = Proxy::new(on_accept_fn.clone(), req_handlers.clone(), "".into(), keep_alive.clone());
         let lua = Lua::new();
 
         // reusing handles means lua allocates so little that the default incremental
@@ -784,7 +686,6 @@ impl LuaConf {
             keep_alive,
             req_handlers,
             on_accept_fn,
-            hooks,
             pool: handles_pool,
         })
     }
@@ -808,7 +709,7 @@ mod tests {
             r#"
 
 
-            proxy:on_request("example.com", function(client, req, context)
+            proxy:on_request("example.com", function(client, req)
                 print("Request from", client.ip, client.port)
                 print(req.method, req.path)
                 resp = proxy:resp_expect_httpbody("127.0.0.1:8000")
@@ -871,17 +772,15 @@ mod tests {
 
         println!();
 
-        let ctx = Context::new();
         handle_ud.set_client(client1.clone());
         handle_ud.set_req(req.clone());
-        handle_ud.set_ctx(ctx.clone());
 
         let resp = lua_state
             .req_handlers
             .borrow()
             .get("example.com")
             .unwrap()
-            .call::<OnRequestResp>((&handle_ud.client_ud, &handle_ud.req_ud, &handle_ud.ctx_ud));
+            .call::<OnRequestResp>((&handle_ud.client_ud, &handle_ud.req_ud));
         println!("{:?}", resp);
 
         Ok(())

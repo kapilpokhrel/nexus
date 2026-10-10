@@ -1,2 +1,0 @@
-name="iploc"
-requires=["ip2location", "nums.bn"]

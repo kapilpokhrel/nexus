@@ -1,2 +1,0 @@
-name="sleeptest"
-requires=["socket","string","math","socket.core"]

@@ -18,9 +18,9 @@ local backend_blessings = {
     "May your bandwidth be plentiful."
 }
 
-blessing:add_incomming_hook(function(client, req)
-    local resp = blessing:resp_update_ctx()
-    local random_blession = backend_blessings[math.random(#backend_blessings)]
-    resp:add_to_ctx("blessing", random_blession)
-    return resp
-end)
+local blessing = {}
+function blessing.get_random_blessing()
+    return backend_blessings[math.random(#backend_blessings)]
+end
+
+return blessing
