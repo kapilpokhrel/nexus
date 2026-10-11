@@ -6,7 +6,7 @@ mod resolve;
 mod session;
 
 use crate::lua_config::{
-    CacheParam, ClientHandle, Deny, ExpectHttp, ForwardHttp, LuaConf, Proxy, Redirect,
+    CacheParam, ClientHandle, CustomHttpResponse, Deny, ExpectHttp, ForwardHttp, LuaConf, Proxy,
     RequestHandle,
 };
 use mlua::prelude::*;
@@ -28,7 +28,7 @@ async fn main() {
         .process_type::<RequestHandle>()
         .process_type::<ExpectHttp>()
         .process_type::<Deny>()
-        .process_type::<Redirect>()
+        .process_type::<CustomHttpResponse>()
         .process_type::<ForwardHttp>();
 
     let json = types.to_json().unwrap();
@@ -63,7 +63,7 @@ async fn main() {
         let _ = stream.set_nodelay(true);
         let state_pass = state.clone();
         monoio::spawn(async move {
-            let _r = session::forward_http(stream, peer_addr, state_pass).await;
+            let _r = session::handle_req(stream, peer_addr, state_pass).await;
         });
     }
 }

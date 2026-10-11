@@ -1,5 +1,4 @@
 use crate::http::{HttpHead, MAX_HEADERS};
-use crate::resolve::ExtraHeaders;
 use monoio::buf::{IoBuf, IoBufMut};
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::TcpStream;
@@ -43,28 +42,47 @@ pub async fn send_n(
     Ok(buf)
 }
 
-/// `body_prefix` is how many body bytes already sit in `buf` right after the
-/// head; they go out in the same write so the head and the start of the body
-/// are one segment instead of two.
-pub async fn write_request_head(
+/// Writes an HTTP head, applying header additions and removals.
+/// `body_prefix` bytes already buffered after the head are written with it.
+pub async fn write_head(
     buf: Vec<u8>,
     dst: &mut TcpStream,
     head: &HttpHead,
-    extra_headers: ExtraHeaders,
+    hdr_ranges: &[MaybeUninit<(Range<usize>, Range<usize>)>],
+    add_headers: &[(String, String)],
+    remove_headers: &[String],
     body_prefix: usize,
 ) -> io::Result<Vec<u8>> {
-    let mut temp_buf: Vec<u8> = Vec::with_capacity(256 + head.header_offset);
+    let mut temp_buf: Vec<u8> = Vec::with_capacity(256 + head.header_end);
     temp_buf.extend_from_slice(&buf[0..head.start_of_header]);
-    if let Some(headers) = extra_headers {
-        for (k, v) in headers {
-            temp_buf.extend_from_slice(k.as_bytes());
-            temp_buf.extend_from_slice(b": ");
-            temp_buf.extend_from_slice(v.as_bytes());
-            temp_buf.extend_from_slice(b"\r\n");
+
+    for h_range in hdr_ranges.iter().take(head.header_count.min(MAX_HEADERS)) {
+        let (name_r, val_r) = unsafe { h_range.assume_init_ref() };
+        let name = &buf[name_r.clone()];
+        if remove_headers
+            .iter()
+            .any(|header| name.eq_ignore_ascii_case(header.as_bytes()))
+            || add_headers
+                .iter()
+                .any(|(header, _)| name.eq_ignore_ascii_case(header.as_bytes()))
+        {
+            continue;
         }
+        temp_buf.extend_from_slice(name);
+        temp_buf.extend_from_slice(b": ");
+        temp_buf.extend_from_slice(&buf[val_r.clone()]);
+        temp_buf.extend_from_slice(b"\r\n");
     }
-    temp_buf.extend_from_slice(&buf[head.start_of_header..head.header_offset]);
-    temp_buf.extend_from_slice(&buf[head.header_offset..head.header_offset + body_prefix]);
+
+    for (name, value) in add_headers {
+        temp_buf.extend_from_slice(name.as_bytes());
+        temp_buf.extend_from_slice(b": ");
+        temp_buf.extend_from_slice(value.as_bytes());
+        temp_buf.extend_from_slice(b"\r\n");
+    }
+
+    temp_buf.extend_from_slice(b"\r\n");
+    temp_buf.extend_from_slice(&buf[head.header_end..(head.header_end + body_prefix)]);
     let (res, _) = dst.write_all(temp_buf).await;
     res?;
     Ok(buf)
@@ -203,38 +221,31 @@ pub async fn relay_chunked(
     }
 }
 
-/// Writes the response status line followed by the upstream's headers, with
-/// `Connection` overridden to `keep_alive`'s value. `Connection` is hop-by-hop:
-/// whatever the upstream sent describes the proxy<->upstream leg, not this one,
-/// so any upstream-supplied `Connection` header is dropped rather than forwarded.
-pub async fn write_response_head(
-    buf: Vec<u8>,
+/// Relays the remaining bytes from `src` until it closes.
+pub async fn relay_until_eof(
+    mut buf: Vec<u8>,
+    start: usize,
+    valid: usize,
+    src: &mut TcpStream,
     dst: &mut TcpStream,
-    head: &HttpHead,
-    hdr_ranges: &[MaybeUninit<(Range<usize>, Range<usize>)>],
-    keep_alive: bool,
-    body_prefix: usize,
 ) -> io::Result<Vec<u8>> {
-    let mut temp_buf: Vec<u8> = Vec::with_capacity(256 + head.header_offset);
-    temp_buf.extend_from_slice(&buf[0..head.start_of_header]);
-    temp_buf.extend_from_slice(if keep_alive {
-        b"Connection: Keep-Alive\r\n"
-    } else {
-        b"Connection: Close\r\n"
-    });
-    for h_range in hdr_ranges.iter().take(head.header_count.min(MAX_HEADERS)) {
-        let (name_r, val_r) = unsafe { h_range.assume_init_ref() };
-        if buf[name_r.clone()].eq_ignore_ascii_case(b"Connection") {
-            continue;
+    let buffered = valid.saturating_sub(start);
+    buf = fwd(buf, dst, buffered, start).await?;
+    loop {
+        if buf.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "relay buffer must not be empty",
+            ));
         }
-        temp_buf.extend_from_slice(&buf[name_r.clone()]);
-        temp_buf.extend_from_slice(b": ");
-        temp_buf.extend_from_slice(&buf[val_r.clone()]);
-        temp_buf.extend_from_slice(b"\r\n");
+        let (res, slice) = src.read(buf.slice_mut(..)).await;
+        buf = slice.into_inner();
+        let n = res?;
+        if n == 0 {
+            return Ok(buf);
+        }
+        let (res, view) = dst.write_all(buf.slice(..n)).await;
+        buf = view.into_inner();
+        res?;
     }
-    temp_buf.extend_from_slice(b"\r\n");
-    temp_buf.extend_from_slice(&buf[head.header_offset..head.header_offset + body_prefix]);
-    let (res, _) = dst.write_all(temp_buf).await;
-    res?;
-    Ok(buf)
 }

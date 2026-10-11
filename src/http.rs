@@ -14,7 +14,7 @@ pub struct HttpHead {
     pub chunked: bool,
     pub start_of_header: usize,
     pub header_count: usize,
-    pub header_offset: usize,
+    pub header_end: usize,
 }
 
 #[derive(Debug)]
@@ -46,7 +46,7 @@ pub fn host_and_request<'a>(
     (
         host,
         Request::new(
-            &buf[..head.header_offset],
+            &buf[..head.header_end],
             req_line.method.as_ref().unwrap().clone(),
             req_line.path.as_ref().unwrap().clone(),
             headers,
@@ -99,6 +99,7 @@ pub async fn read_headers(
         let mut raw = [httparse::EMPTY_HEADER; MAX_HEADERS];
         match httparse::parse_headers(&buf[se..ptr], &mut raw) {
             Ok(httparse::Status::Complete((hlen, parsed))) => {
+                // hlen does include final empty line after header too
                 let header_end = se + hlen;
                 for (i, h) in parsed.iter().enumerate() {
                     hdr_ranges[i] = MaybeUninit::new((
@@ -156,7 +157,7 @@ pub async fn read_headers(
                         chunked,
                         start_of_header: se,
                         header_count: h_count,
-                        header_offset: header_end,
+                        header_end,
                     },
                     RequestInfo {
                         host,

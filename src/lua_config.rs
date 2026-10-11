@@ -10,8 +10,8 @@ mod handler_response;
 mod handles;
 
 pub use handler_response::{
-    Deny, ExpectHttp, ForwardHttp, OnAcceptFn, OnAcceptHandlerResp, OnAcceptTlsBlock, OnRequestFn,
-    OnRequestHandlerResp, Redirect
+    CustomHttpResponse, Deny, ExpectHttp, ForwardHttp, OnAcceptFn,
+    OnAcceptHandlerResp, OnAcceptTlsBlock, OnRequestFn, OnRequestHandlerResp,
 };
 pub use handles::{Client, ClientHandle, HandlePool, Request, RequestHandle};
 
@@ -108,10 +108,8 @@ impl TealData for Proxy {
                     return val.clone();
                 }
                 let retval = func.call::<LuaValue>(args);
-                this.cached_results.insert(
-                    key.into(),
-                    CachedValue::new(retval.clone(), cache_info.ttl),
-                );
+                this.cached_results
+                    .insert(key.into(), CachedValue::new(retval.clone(), cache_info.ttl));
                 retval
             },
         );
@@ -171,12 +169,13 @@ impl TealData for Proxy {
             Ok(resp)
         });
 
-        methods.add_method("redirect", |_lua, _, (status, location): (u16, String)| {
-            let resp = Redirect {
-                status,
-                location: location.into(),
-            };
-            Ok(resp)
+        methods.add_method("custom_http_response", |_lua, _, ()| {
+            Ok(CustomHttpResponse {
+                status: 200,
+                reason: "OK".to_string(),
+                headers: Vec::new(),
+                body: String::new(),
+            })
         });
     }
 }
@@ -235,6 +234,14 @@ mod tests {
             proxy:on_request("example.com", function(client, req)
                 print("Request from", client.ip, client.port)
                 print(req.method, req.path)
+                if client.ip == "127.0.0.1" then
+                    local response = proxy:custom_http_response()
+                    response:set_status(201)
+                    response:set_reason("Created")
+                    response:set_body("Created")
+                    response:add_header("Content-Type", "text/plain")
+                    return response
+                end
                 handler_resp = proxy:forward_http("127.0.0.1:8000")
                 handler_resp:set_cache(60, "$url")
                 return handler_resp
@@ -250,13 +257,18 @@ mod tests {
                     handler_resp:set_tls("/path/to/keyfile")
                     return handler_resp
 
-                elseif client.ip == "127.0.0.1" then
-                    return proxy:redirect(201, "https://example.com")
+                elseif client.ip == "192.168.1.1" then
+                    local response = proxy:custom_http_response()
+                    response:set_status(403)
+                    response:set_reason("Forbidden")
+                    response:set_body("Forbidden")
+                    return response
 
                 else
                     return proxy:deny("NOPE")
                 end
             end)
+
         "#,
         );
         source.exec()?;
