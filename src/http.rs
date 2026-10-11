@@ -35,23 +35,68 @@ pub fn host_and_request<'a>(
     hdr: &[MaybeUninit<(Range<usize>, Range<usize>)>; MAX_HEADERS],
     head: &HttpHead,
     req_line: &RequestInfo,
-) -> (&'a str, Request) {
+) -> io::Result<(&'a str, Request)> {
+    let host_range = req_line.host.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "request is missing a Host header",
+        )
+    })?;
+    let method = req_line.method.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid HTTP request line: missing method",
+        )
+    })?;
+    let path = req_line.path.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid HTTP request line: missing path",
+        )
+    })?;
+
+    let host = std::str::from_utf8(&buf[host_range.clone()]).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid Host header: {e}"),
+        )
+    })?;
+    std::str::from_utf8(&buf[method.clone()])
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("invalid method: {e}")))?;
+    std::str::from_utf8(&buf[path.clone()]).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid request path: {e}"),
+        )
+    })?;
+
     let n = head.header_count.min(MAX_HEADERS);
     let mut headers = Vec::with_capacity(n);
-    for h in hdr.iter().take(n) {
-        headers.push(unsafe { h.assume_init_read() });
+    for range in hdr.iter().take(n) {
+        let (name, value) = unsafe { range.assume_init_ref() };
+        std::str::from_utf8(&buf[name.clone()]).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid header name: {e}"),
+            )
+        })?;
+        std::str::from_utf8(&buf[value.clone()]).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid header value: {e}"),
+            )
+        })?;
+        headers.push((name.clone(), value.clone()));
     }
-    let host =
-        unsafe { std::str::from_utf8_unchecked(&buf[req_line.host.as_ref().unwrap().clone()]) };
-    (
+    Ok((
         host,
         Request::new(
             &buf[..head.header_end],
-            req_line.method.as_ref().unwrap().clone(),
-            req_line.path.as_ref().unwrap().clone(),
+            method.clone(),
+            path.clone(),
             headers,
         ),
-    )
+    ))
 }
 
 /// Whether the client's request indicates the connection should be kept open
@@ -185,5 +230,52 @@ pub async fn read_headers(
             }
             Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_head() -> HttpHead {
+        HttpHead {
+            content_len: None,
+            chunked: false,
+            start_of_header: 0,
+            header_count: 0,
+            header_end: 0,
+        }
+    }
+
+    #[test]
+    fn missing_host_is_an_error() {
+        let buf = b"GET / HTTP/1.1\r\n";
+        let req_line = RequestInfo {
+            host: None,
+            method: Some(0..3),
+            path: Some(4..5),
+            version: Some(6..14),
+        };
+        let hdr = [const { MaybeUninit::uninit() }; MAX_HEADERS];
+
+        let err = host_and_request(buf, &hdr, &empty_head(), &req_line).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("Host"));
+    }
+
+    #[test]
+    fn missing_method_is_an_error() {
+        let buf = b"GET / HTTP/1.1\r\n";
+        let req_line = RequestInfo {
+            host: Some(0..3),
+            method: None,
+            path: Some(4..5),
+            version: Some(6..14),
+        };
+        let hdr = [const { MaybeUninit::uninit() }; MAX_HEADERS];
+
+        let err = host_and_request(buf, &hdr, &empty_head(), &req_line).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("request line"));
     }
 }

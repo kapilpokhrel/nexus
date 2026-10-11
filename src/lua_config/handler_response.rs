@@ -3,6 +3,30 @@ use mlua::prelude::*;
 use tealr::mlu::{FromLuaExact, TealData, TealDataMethods, TypedFunction};
 use tealr::{ToTypename, create_union_mlua};
 
+fn valid_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+}
+
+fn valid_header_value(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte == b'\t' || (b' '..=b'~').contains(&byte) || byte >= 0x80)
+}
+
+fn valid_reason(reason: &str) -> bool {
+    valid_header_value(reason)
+}
+
+fn valid_patch_header_name(name: &str) -> bool {
+    valid_header_name(name)
+        && !["connection", "content-length", "transfer-encoding"]
+            .iter()
+            .any(|reserved| name.eq_ignore_ascii_case(reserved))
+}
+
 #[derive(Debug, Clone)]
 pub struct OnAcceptTlsBlock {
     pub enabled: bool,
@@ -25,7 +49,7 @@ impl FromLuaExact for ExpectHttp {
             _ => Err(LuaError::FromLuaConversionError {
                 from: lua_value.type_name(),
                 to: "ExpectHttp".to_string(),
-                message: Some("Expected a userdata with 'max_header_size', 'max_header_count', 'expected_method', 'header_timeout', and 'tls' fields".to_string()),
+                message: Some("Expected an ExpectHttp userdata".to_string()),
             }),
         }
     }
@@ -34,22 +58,47 @@ impl FromLuaExact for ExpectHttp {
 impl tealr::mlu::TealData for ExpectHttp {
     fn add_methods<F: tealr::mlu::TealDataMethods<Self>>(fields: &mut F) {
         fields.add_method_mut("set_max_header_size", |_, this, size: usize| {
+            if size == 0 {
+                return Err(LuaError::RuntimeError(
+                    "max_header_size must be greater than zero".into(),
+                ));
+            }
             this.max_header_size = size;
             Ok(())
         });
         fields.add_method_mut("set_max_header_count", |_, this, count: usize| {
+            if count == 0 {
+                return Err(LuaError::RuntimeError(
+                    "max_header_count must be greater than zero".into(),
+                ));
+            }
             this.max_header_count = count;
             Ok(())
         });
         fields.add_method_mut("set_header_timeout", |_, this, timeout: u64| {
+            if timeout == 0 {
+                return Err(LuaError::RuntimeError(
+                    "header_timeout must be greater than zero".into(),
+                ));
+            }
             this.header_timeout = timeout;
             Ok(())
         });
         fields.add_method_mut("set_expected_method", |_, this, method: String| {
+            if !method.is_empty() && !valid_header_name(&method) {
+                return Err(LuaError::RuntimeError(
+                    "expected_method must be a valid HTTP token".into(),
+                ));
+            }
             this.expected_method = method.into();
             Ok(())
         });
         fields.add_method_mut("set_tls", |_, this, tls_keyfile: String| {
+            if tls_keyfile.is_empty() {
+                return Err(LuaError::RuntimeError(
+                    "TLS keyfile path cannot be empty".into(),
+                ));
+            }
             this.tls = OnAcceptTlsBlock {
                 enabled: true,
                 keyfile: tls_keyfile.into(),
@@ -79,7 +128,7 @@ impl FromLuaExact for Deny {
             _ => Err(LuaError::FromLuaConversionError {
                 from: lua_value.type_name(),
                 to: "Deny".to_string(),
-                message: Some("Expected a userdata with 'reason' field".to_string()),
+                message: Some("Expected a Deny userdata".to_string()),
             }),
         }
     }
@@ -115,18 +164,48 @@ impl tealr::mlu::TealData for CustomHttpResponse {
 
     fn add_methods<M: TealDataMethods<Self>>(methods: &mut M) {
         methods.add_method_mut("set_status", |_, this, status: u16| {
+            if !(200..=599).contains(&status) {
+                return Err(LuaError::RuntimeError(
+                    "custom response status must be between 200 and 599".into(),
+                ));
+            }
+            if matches!(status, 204 | 304) && !this.body.is_empty() {
+                return Err(LuaError::RuntimeError(
+                    "204 and 304 responses cannot have a body".into(),
+                ));
+            }
             this.status = status;
             Ok(())
         });
         methods.add_method_mut("set_reason", |_, this, reason: String| {
+            if !valid_reason(&reason) {
+                return Err(LuaError::RuntimeError(
+                    "reason phrase contains invalid HTTP characters".into(),
+                ));
+            }
             this.reason = reason;
             Ok(())
         });
         methods.add_method_mut("set_body", |_, this, body: String| {
+            if matches!(this.status, 204 | 304) && !body.is_empty() {
+                return Err(LuaError::RuntimeError(
+                    "204 and 304 responses cannot have a body".into(),
+                ));
+            }
             this.body = body;
             Ok(())
         });
         methods.add_method_mut("add_header", |_, this, (name, value): (String, String)| {
+            if !valid_header_name(&name)
+                || !valid_header_value(&value)
+                || name.eq_ignore_ascii_case("content-length")
+                || name.eq_ignore_ascii_case("connection")
+                || name.eq_ignore_ascii_case("transfer-encoding")
+            {
+                return Err(LuaError::RuntimeError(
+                    "invalid or reserved custom response header".into(),
+                ));
+            }
             this.headers.push((name, value));
             Ok(())
         });
@@ -196,16 +275,31 @@ impl FromLuaExact for ForwardHttp {
 impl tealr::mlu::TealData for ForwardHttp {
     fn add_methods<F: TealDataMethods<Self>>(methods: &mut F) {
         methods.add_method_mut("set_max_body_size", |_, this, size: usize| {
+            if size == 0 {
+                return Err(LuaError::RuntimeError(
+                    "max_body_size must be greater than zero".into(),
+                ));
+            }
             this.max_body_size = size;
             Ok(())
         });
         methods.add_method_mut("set_proxy_read_timeout", |_, this, timeout: Option<u32>| {
+            if timeout == Some(0) {
+                return Err(LuaError::RuntimeError(
+                    "proxy_read_timeout must be greater than zero".into(),
+                ));
+            }
             this.proxy_read_timeout = timeout;
             Ok(())
         });
         methods.add_method_mut(
             "set_client_body_timeout",
             |_, this, timeout: Option<u32>| {
+                if timeout == Some(0) {
+                    return Err(LuaError::RuntimeError(
+                        "client_body_timeout must be greater than zero".into(),
+                    ));
+                }
                 this.client_body_timeout = timeout;
                 Ok(())
             },
@@ -219,16 +313,30 @@ impl tealr::mlu::TealData for ForwardHttp {
             Ok(())
         });
         methods.add_method_mut("add_header", |_, this, (key, val): (String, String)| {
+            if !valid_patch_header_name(&key) || !valid_header_value(&val) {
+                return Err(LuaError::RuntimeError(
+                    "invalid HTTP request header name or value".into(),
+                ));
+            }
             let patch = this
                 .headers_patch
                 .get_or_insert_with(HeaderPatchBlock::empty);
-            match patch.add_headers.iter_mut().find(|(k, _)| *k == key) {
+            match patch
+                .add_headers
+                .iter_mut()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&key))
+            {
                 Some(entry) => entry.1 = val,
                 None => patch.add_headers.push((key, val)),
             }
             Ok(())
         });
         methods.add_method_mut("remove_header", |_, this, key: String| {
+            if !valid_patch_header_name(&key) {
+                return Err(LuaError::RuntimeError(
+                    "invalid HTTP request header name".into(),
+                ));
+            }
             this.headers_patch
                 .get_or_insert_with(HeaderPatchBlock::empty)
                 .remove_headers

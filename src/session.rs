@@ -215,12 +215,19 @@ pub async fn handle_req(
         buf = b;
 
         // build host + Request view
-        let (host, req) = http::host_and_request(&buf, &hdr_buf, &head, &req_line);
+        let (host, req) = http::host_and_request(&buf, &hdr_buf, &head, &req_line)
+            .map_err(|e| io::Error::new(e.kind(), format!("client {peer_addr}: {e}")))?;
         let keep_alive_requested = http::client_wants_keep_alive(&buf, &req_line, &req);
 
         // decide
-        let on_request_handler_resp =
-            resolve::run_on_request(host, client_t.clone(), req, &state).await?;
+        let Some(on_request_handler_resp) =
+            resolve::run_on_request(host, client_t.clone(), req, &state).await?
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("no on_request handler registered for host '{host}'"),
+            ));
+        };
         match on_request_handler_resp {
             // completely drop or we can send a custom response to the client
             OnRequestHandlerResp::Deny(_x) => return Ok(()),

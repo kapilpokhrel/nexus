@@ -10,10 +10,10 @@ mod handler_response;
 mod handles;
 
 pub use handler_response::{
-    CustomHttpResponse, Deny, ExpectHttp, ForwardHttp, OnAcceptFn,
-    OnAcceptHandlerResp, OnAcceptTlsBlock, OnRequestFn, OnRequestHandlerResp,
+    CustomHttpResponse, Deny, ExpectHttp, ForwardHttp, OnAcceptFn, OnAcceptHandlerResp,
+    OnAcceptTlsBlock, OnRequestFn, OnRequestHandlerResp,
 };
-pub use handles::{Client, ClientHandle, HandlePool, Request, RequestHandle};
+pub use handles::{Client, ClientHandle, HandleFactory, Request, RequestHandle};
 
 tealr::create_generic_mlua!(X);
 #[derive(Debug)]
@@ -87,7 +87,14 @@ impl TealData for Proxy {
     fn add_methods<M: TealDataMethods<Self>>(methods: &mut M) {
         methods.add_method_mut("listen_on", |_, this, addr: String| {
             this.listen_addr = addr.into();
-            Ok(())
+            // other validity checks required too
+            if this.listen_addr.is_empty() {
+                Err(mlua::Error::RuntimeError(
+                    "listen_on: address cannot be empty".into(),
+                ))
+            } else {
+                Ok(())
+            }
         });
 
         methods.add_method_mut(
@@ -125,6 +132,12 @@ impl TealData for Proxy {
         );
 
         methods.add_method_mut("on_request", |_, this, (host, f): (String, OnRequestFn)| {
+            // other validity checks can be added here, like valid host format, etc.
+            if host.is_empty() {
+                return Err(mlua::Error::RuntimeError(
+                    "on_reqeust: host address cannot be empty".into(),
+                ));
+            }
             this.req_handlers.borrow_mut().insert(host.into(), f.into());
             Ok(())
         });
@@ -135,6 +148,12 @@ impl TealData for Proxy {
         });
 
         methods.add_method("forward_http", |_lua, _, upstream: String| {
+            // same as previous; other validity checks required
+            if upstream.is_empty() {
+                return Err(mlua::Error::RuntimeError(
+                    "forward_http: upstream address cannot be empty".into(),
+                ));
+            }
             let resp = ForwardHttp {
                 upstream,
                 max_body_size: 1048576,
@@ -184,31 +203,29 @@ pub struct LuaConf {
     pub lua: Lua,
     pub req_handlers: HandlerMap,
     pub on_accept_fn: OnAcceptFnSlot,
-    pub pool: HandlePool,
+    pub handles: HandleFactory,
 }
 
 impl LuaConf {
-    pub fn new(pool_size: usize) -> Result<Self, LuaError> {
+    pub fn new() -> Result<Self, LuaError> {
         let req_handlers: HandlerMap = Rc::new(RefCell::new(HashMap::new()));
         let on_accept_fn: OnAcceptFnSlot = Rc::new(RefCell::new(None));
 
         let proxy = Proxy::new(on_accept_fn.clone(), req_handlers.clone(), "".into());
         let lua = Lua::new();
 
-        // reusing handles means lua allocates so little that the default incremental
-        // GC stops keeping up; generational collects it at no measurable cost
         lua.gc_gen(20, 100);
 
-        let proxy_ud = lua.create_userdata(proxy).unwrap();
+        let proxy_ud = lua.create_userdata(proxy)?;
         lua.globals().set("proxy", proxy_ud)?;
 
-        let handles_pool = HandlePool::new(lua.clone(), pool_size);
+        let handles = HandleFactory::new(lua.clone());
 
         Ok(LuaConf {
             lua,
             req_handlers,
             on_accept_fn,
-            pool: handles_pool,
+            handles,
         })
     }
 }
@@ -225,7 +242,7 @@ mod tests {
             &[("Host", "example.com"), ("ContentLength", "64")],
         );
 
-        let lua_state = LuaConf::new(1)?;
+        let lua_state = LuaConf::new()?;
 
         let source = lua_state.lua.load(
             r#"
@@ -240,6 +257,16 @@ mod tests {
                     response:set_reason("Created")
                     response:set_body("Created")
                     response:add_header("Content-Type", "text/plain")
+                    assert(not pcall(function()
+                        response:add_header("X-Test", "ok\r\nInjected: yes")
+                    end))
+                    assert(not pcall(function()
+                        response:add_header("Content-Length", "1")
+                    end))
+
+                    local request = proxy:forward_http("127.0.0.1:8000")
+                    assert(not pcall(function() request:add_header("Bad Header", "value") end))
+                    assert(not pcall(function() request:add_header("X-Test", "bad\r\nvalue") end))
                     return response
                 end
                 handler_resp = proxy:forward_http("127.0.0.1:8000")
@@ -273,11 +300,11 @@ mod tests {
         );
         source.exec()?;
 
-        let client1 = Client::new("127.0.0.1".parse().unwrap(), 6969);
-        let client2 = Client::new("10.100.1.1".parse().unwrap(), 6969);
-        let client3 = Client::new("192.168.1.1".parse().unwrap(), 6969);
+        let client1 = Client::new("127.0.0.1".parse()?, 6969);
+        let client2 = Client::new("10.100.1.1".parse()?, 6969);
+        let client3 = Client::new("192.168.1.1".parse()?, 6969);
 
-        let handle_ud = lua_state.pool.checkout();
+        let handle_ud = lua_state.handles.create()?;
         handle_ud.set_client(client1.clone());
         let resp = lua_state
             .on_accept_fn

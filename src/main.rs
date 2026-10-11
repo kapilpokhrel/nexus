@@ -16,11 +16,12 @@ use std::rc::Rc;
 use std::time::Duration;
 use tealr::TypeWalker;
 
-pub const CONF_POOL_SIZE: usize = 8;
-
 #[allow(unused_variables)]
 #[monoio::main(threads = 8, timer_enabled = true)]
 async fn main() {
+    unsafe { std::env::set_var("RUST_LOG", "warn") };
+    let _ = env_logger::try_init();
+
     let types = TypeWalker::new()
         .process_type::<Proxy>()
         .process_type::<CacheParam>()
@@ -31,39 +32,57 @@ async fn main() {
         .process_type::<CustomHttpResponse>()
         .process_type::<ForwardHttp>();
 
-    let json = types.to_json().unwrap();
-    if fs::write("conduit.json", json).is_err() {
-        println!("Teal doc json write failed");
+    if let Ok(json) = types.to_json() {
+        if fs::write("conduit.json", json).is_err() {
+            log::error!("Teal doc json write failed");
+        }
+    } else {
+        log::error!("Teal doc json generation failed");
     }
 
-    let conf_source = fs::read("config.lua").unwrap();
+    let conf_source = fs::read("config.lua").expect("config.lua not found in working directory");
 
-    let state = Rc::new(LuaConf::new(CONF_POOL_SIZE).unwrap());
-    let source = state.lua.load(str::from_utf8(&conf_source).unwrap());
-    source.exec().unwrap();
+    let state = Rc::new(LuaConf::new().expect("lua configuration state initialization failed"));
+
+    let source = state
+        .lua
+        .load(str::from_utf8(&conf_source).expect("invalid utf-8 in config.lua"));
+    source.exec().expect("config soruce execution failed");
 
     let host: String = state
         .lua
         .globals()
         .get::<LuaAnyUserData>("proxy")
-        .unwrap()
+        .expect("proxy not defined in config")
         .borrow::<Proxy>()
         .unwrap()
         .listen_addr
         .as_ref()
         .into();
     println!("{}", host);
-    let listener = TcpListener::bind(host).unwrap();
-    net::enable_defer_accept(&listener, Duration::from_secs(1)).unwrap();
+    let listener = TcpListener::bind(host).expect("TCP binding failed");
+
+    if net::enable_defer_accept(&listener, Duration::from_secs(1)).is_err() {
+        log::warn!("failed to enable TCP defer accept");
+    };
 
     loop {
-        let Ok((stream, peer_addr)) = listener.accept().await else {
-            continue;
+        let (stream, peer_addr) = match listener.accept().await {
+            Ok(connection) => connection,
+            Err(e) => {
+                log::error!("TCP accept failed: {e}");
+                continue;
+            }
         };
-        let _ = stream.set_nodelay(true);
+        if stream.set_nodelay(true).is_err() {
+            log::debug!("TCP no delay set failed")
+        }
         let state_pass = state.clone();
         monoio::spawn(async move {
-            let _r = session::handle_req(stream, peer_addr, state_pass).await;
+            let r = session::handle_req(stream, peer_addr, state_pass).await;
+            if let Err(e) = r {
+                log::error!("client {peer_addr}: {e}");
+            }
         });
     }
 }

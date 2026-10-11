@@ -30,14 +30,14 @@ pub struct OnRequestHandleUDs {
 }
 
 impl OnRequestHandleUDs {
-    pub fn new(lua: &Lua, slot: Rc<RefCell<OnRequestParamSlot>>) -> Self {
-        let client_ud = lua.create_userdata(ClientHandle(slot.clone())).unwrap();
-        let req_ud = lua.create_userdata(RequestHandle(slot.clone())).unwrap();
-        Self {
+    pub fn new(lua: &Lua, slot: Rc<RefCell<OnRequestParamSlot>>) -> LuaResult<Self> {
+        let client_ud = lua.create_userdata(ClientHandle(slot.clone()))?;
+        let req_ud = lua.create_userdata(RequestHandle(slot.clone()))?;
+        Ok(Self {
             slot,
             client_ud,
             req_ud,
-        }
+        })
     }
 
     pub fn set_client(&self, client: Client) {
@@ -48,42 +48,33 @@ impl OnRequestHandleUDs {
         self.slot.borrow_mut().req = Some(req);
     }
 
-    pub fn clear(&self) {
+    fn clear(&self) {
         self.slot.borrow_mut().client = None;
         self.slot.borrow_mut().req = None;
     }
 }
 
-pub struct HandlePool {
-    lua: Lua,
-    pool: Vec<Rc<OnRequestHandleUDs>>,
+impl Drop for OnRequestHandleUDs {
+    fn drop(&mut self) {
+        self.clear();
+    }
 }
 
-impl HandlePool {
-    pub fn new(lua: Lua, pool_size: usize) -> Self {
-        let mut pool = Vec::with_capacity(pool_size);
-        for _ in 0..pool_size {
-            let slot = Rc::new(RefCell::new(OnRequestParamSlot {
-                client: None,
-                req: None,
-            }));
-            pool.push(Rc::new(OnRequestHandleUDs::new(&lua, slot)));
-        }
-        Self { lua, pool }
+pub struct HandleFactory {
+    lua: Lua,
+}
+
+impl HandleFactory {
+    pub fn new(lua: Lua) -> Self {
+        Self { lua }
     }
 
-    pub fn checkout(&self) -> Rc<OnRequestHandleUDs> {
-        for uds in &self.pool {
-            if Rc::strong_count(uds) == 1 {
-                uds.clear();
-                return uds.clone();
-            }
-        }
+    pub fn create(&self) -> LuaResult<OnRequestHandleUDs> {
         let slot = Rc::new(RefCell::new(OnRequestParamSlot {
             client: None,
             req: None,
         }));
-        Rc::new(OnRequestHandleUDs::new(&self.lua, slot))
+        OnRequestHandleUDs::new(&self.lua, slot)
     }
 }
 
@@ -108,10 +99,18 @@ teal_name!(ClientHandle, "Client");
 impl tealr::mlu::TealData for ClientHandle {
     fn add_fields<F: tealr::mlu::TealDataFields<Self>>(fields: &mut F) {
         fields.add_field_method_get("ip", |lua, this| {
-            lua.create_string(this.0.borrow().client.as_ref().unwrap().0.ip.to_string())
+            let client = this.0.borrow().client.clone().ok_or_else(|| {
+                LuaError::RuntimeError("client handle is no longer valid".to_string())
+            })?;
+            lua.create_string(client.0.ip.to_string())
         });
         fields.add_field_method_get("port", |_, this| {
-            Ok(this.0.borrow().client.as_ref().unwrap().0.port)
+            this.0
+                .borrow()
+                .client
+                .as_ref()
+                .map(|client| client.0.port)
+                .ok_or_else(|| LuaError::RuntimeError("client handle is no longer valid".into()))
         });
     }
 }
@@ -200,14 +199,23 @@ teal_name!(RequestHandle, "Request");
 impl tealr::mlu::TealData for RequestHandle {
     fn add_fields<F: tealr::mlu::TealDataFields<Self>>(fields: &mut F) {
         fields.add_field_method_get("method", |lua, this| {
-            lua.create_string(this.0.borrow().req.as_ref().unwrap().0.method())
+            let req = this.0.borrow().req.clone().ok_or_else(|| {
+                LuaError::RuntimeError("request handle is no longer valid".to_string())
+            })?;
+            lua.create_string(req.0.method())
         });
         fields.add_field_method_get("path", |lua, this| {
-            lua.create_string(this.0.borrow().req.as_ref().unwrap().0.path())
+            let req = this.0.borrow().req.clone().ok_or_else(|| {
+                LuaError::RuntimeError("request handle is no longer valid".to_string())
+            })?;
+            lua.create_string(req.0.path())
         });
         fields.add_field_method_get("headers", |lua, this| {
+            let req = this.0.borrow().req.clone().ok_or_else(|| {
+                LuaError::RuntimeError("request handle is no longer valid".to_string())
+            })?;
             let table = lua.create_table()?;
-            for (k, v) in this.0.borrow().req.as_ref().unwrap().0.iter() {
+            for (k, v) in req.0.iter() {
                 table.set(k, v)?;
             }
             Ok(table)
@@ -215,15 +223,52 @@ impl tealr::mlu::TealData for RequestHandle {
     }
     fn add_methods<M: TealDataMethods<Self>>(methods: &mut M) {
         methods.add_method("header", |_, this, h: String| {
-            Ok(this
-                .0
-                .borrow()
-                .req
-                .as_ref()
-                .unwrap()
-                .0
-                .header(&h)
-                .map(str::to_string))
+            let req = this.0.borrow().req.clone().ok_or_else(|| {
+                LuaError::RuntimeError("request handle is no longer valid".to_string())
+            })?;
+            Ok(req.0.header(&h).map(str::to_string))
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retained_handles_fail_after_handler_returns() -> LuaResult<()> {
+        let lua = Lua::new();
+        let factory = HandleFactory::new(lua.clone());
+
+        lua.load(
+            r#"
+            handler = function(client, req)
+                saved_client = client
+                saved_request = req
+            end
+            "#,
+        )
+        .exec()?;
+
+        let handles = factory.create()?;
+        handles.set_client(Client::new("127.0.0.1".parse().unwrap(), 8080));
+        handles.set_req(Request::from_parts("GET", "/", &[]));
+        lua.globals()
+            .get::<LuaFunction>("handler")?
+            .call::<()>((&handles.client_ud, &handles.req_ud))?;
+        drop(handles);
+
+        let saved_handles_are_invalid: bool = lua
+            .load(
+                r#"
+                local client_ok = pcall(function() return saved_client.ip end)
+                local request_ok = pcall(function() return saved_request.method end)
+                return not client_ok and not request_ok
+                "#,
+            )
+            .eval()?;
+        assert!(saved_handles_are_invalid);
+
+        Ok(())
     }
 }
