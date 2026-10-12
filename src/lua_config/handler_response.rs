@@ -3,6 +3,23 @@ use mlua::prelude::*;
 use tealr::mlu::{FromLuaExact, TealData, TealDataMethods, TypedFunction};
 use tealr::{ToTypename, create_union_mlua};
 
+macro_rules! impl_from_lua_exact_userdata {
+    ($type:ty) => {
+        impl FromLuaExact for $type {
+            fn from_lua_exact(lua_value: LuaValue, _lua: &Lua) -> LuaResult<Self> {
+                match lua_value {
+                    LuaValue::UserData(ud) if ud.is::<Self>() => ud.take::<Self>(),
+                    _ => Err(LuaError::FromLuaConversionError {
+                        from: lua_value.type_name(),
+                        to: stringify!($type).to_string(),
+                        message: Some(format!("Expected a {} userdata", stringify!($type))),
+                    }),
+                }
+            }
+        }
+    };
+}
+
 fn valid_header_name(name: &str) -> bool {
     !name.is_empty()
         && name
@@ -42,18 +59,7 @@ pub struct ExpectHttp {
     pub tls: OnAcceptTlsBlock,
 }
 
-impl FromLuaExact for ExpectHttp {
-    fn from_lua_exact(lua_value: LuaValue, _lua: &Lua) -> LuaResult<Self> {
-        match lua_value {
-            LuaValue::UserData(ud) if ud.is::<Self>() => ud.take::<Self>(),
-            _ => Err(LuaError::FromLuaConversionError {
-                from: lua_value.type_name(),
-                to: "ExpectHttp".to_string(),
-                message: Some("Expected an ExpectHttp userdata".to_string()),
-            }),
-        }
-    }
-}
+impl_from_lua_exact_userdata!(ExpectHttp);
 
 impl tealr::mlu::TealData for ExpectHttp {
     fn add_methods<F: tealr::mlu::TealDataMethods<Self>>(fields: &mut F) {
@@ -121,18 +127,7 @@ impl TealData for Deny {
     }
 }
 
-impl FromLuaExact for Deny {
-    fn from_lua_exact(lua_value: LuaValue, _lua: &Lua) -> LuaResult<Self> {
-        match lua_value {
-            LuaValue::UserData(ud) if ud.is::<Self>() => ud.take::<Self>(),
-            _ => Err(LuaError::FromLuaConversionError {
-                from: lua_value.type_name(),
-                to: "Deny".to_string(),
-                message: Some("Expected a Deny userdata".to_string()),
-            }),
-        }
-    }
-}
+impl_from_lua_exact_userdata!(Deny);
 
 #[derive(Debug, Clone, tealr::mlu::UserData, ToTypename)]
 pub struct CustomHttpResponse {
@@ -142,18 +137,7 @@ pub struct CustomHttpResponse {
     pub body: String,
 }
 
-impl FromLuaExact for CustomHttpResponse {
-    fn from_lua_exact(lua_value: LuaValue, _lua: &Lua) -> LuaResult<Self> {
-        match lua_value {
-            LuaValue::UserData(ud) if ud.is::<Self>() => ud.take::<Self>(),
-            _ => Err(LuaError::FromLuaConversionError {
-                from: lua_value.type_name(),
-                to: "CustomHttpResponse".to_string(),
-                message: Some("Expected a userdata".to_string()),
-            }),
-        }
-    }
-}
+impl_from_lua_exact_userdata!(CustomHttpResponse);
 
 impl tealr::mlu::TealData for CustomHttpResponse {
     fn add_fields<F: tealr::mlu::TealDataFields<Self>>(fields: &mut F) {
@@ -259,18 +243,7 @@ pub struct ForwardHttp {
     pub keep_alive: bool,
 }
 
-impl FromLuaExact for ForwardHttp {
-    fn from_lua_exact(lua_value: LuaValue, _: &Lua) -> LuaResult<Self> {
-        match lua_value {
-            LuaValue::UserData(ud) if ud.is::<Self>() => ud.take::<Self>(),
-            _ => Err(LuaError::FromLuaConversionError {
-                from: lua_value.type_name(),
-                to: "ForwardHttp".to_string(),
-                message: Some("Expected a userdata".to_string()),
-            }),
-        }
-    }
-}
+impl_from_lua_exact_userdata!(ForwardHttp);
 
 impl tealr::mlu::TealData for ForwardHttp {
     fn add_methods<F: TealDataMethods<Self>>(methods: &mut F) {
