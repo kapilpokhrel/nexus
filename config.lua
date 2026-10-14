@@ -4,6 +4,8 @@ local iploc = require("iploc")
 proxy:on_request("example.com", function(client, req)
     handler_resp = proxy:forward_http("127.0.0.1:8000")
     handler_resp:keep_alive(false)
+    handler_resp:set_max_request_body_size(1048576)
+    handler_resp:set_max_response_body_size(1048576)
     handler_resp:add_header("X_GREETING", "HELLO")
     handler_resp:add_header("COUNTRY", proxy:cached_call(
         "example.com",

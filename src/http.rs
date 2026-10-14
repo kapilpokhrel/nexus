@@ -2,11 +2,13 @@ use crate::lua_config::Request;
 use monoio::buf::IoBufMut;
 use monoio::io::AsyncReadRent;
 use monoio::net::TcpStream;
+use monoio::time::{Instant, timeout_at};
 use std::io;
 use std::mem::MaybeUninit;
 use std::ops::Range;
 
 pub const MAX_HEADERS: usize = 64;
+pub const MAX_HEADER_SIZE: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub struct HttpHead {
@@ -122,10 +124,20 @@ pub async fn read_headers(
     mut buf: Vec<u8>,
     stream: &mut TcpStream,
     hdr_ranges: &mut [MaybeUninit<(Range<usize>, Range<usize>)>],
+    max_header_size: usize,
+    max_header_count: usize,
+    deadline: Option<Instant>,
 ) -> io::Result<(Vec<u8>, HttpHead, RequestInfo, usize)> {
     let mut ptr = 0;
     loop {
-        let (res, slice) = stream.read(buf.slice_mut(ptr..)).await;
+        let read = stream.read(buf.slice_mut(ptr..));
+        let (res, slice) = if let Some(deadline) = deadline {
+            timeout_at(deadline, read).await.map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "HTTP header read timed out")
+            })?
+        } else {
+            read.await
+        };
         buf = slice.into_inner();
         let n = res?;
         if n == 0 {
@@ -146,6 +158,18 @@ pub async fn read_headers(
             Ok(httparse::Status::Complete((hlen, parsed))) => {
                 // hlen does include final empty line after header too
                 let header_end = se + hlen;
+                if header_end > max_header_size {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "HTTP header block exceeds configured size limit",
+                    ));
+                }
+                if parsed.len() > max_header_count {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "HTTP header count exceeds configured limit",
+                    ));
+                }
                 for (i, h) in parsed.iter().enumerate() {
                     hdr_ranges[i] = MaybeUninit::new((
                         range_of(&buf, h.name.as_bytes()),
@@ -214,6 +238,12 @@ pub async fn read_headers(
                 ));
             }
             Ok(httparse::Status::Partial) => {
+                if ptr >= max_header_size {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "HTTP header block exceeds configured size limit",
+                    ));
+                }
                 if (se..ptr.saturating_sub(3))
                     .rev()
                     .any(|i| buf[i..i + 4] == b"\r\n\r\n"[..])

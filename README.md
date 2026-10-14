@@ -50,22 +50,36 @@ proxy:on_accept(function(client)
     if client.ip == "10.100.1.1" then
         local handler_resp = proxy:expect_http()
         handler_resp:set_max_header_size(16384)
-        handler_resp:set_max_header_count(128)
-        handler_resp:set_expected_method("GET")
+        handler_resp:set_max_header_count(64)
+        handler_resp:set_header_timeout(5)
         return handler_resp
     else
         return proxy:deny("NOPE")
     end
 end)
 ```
+
+Header size is limited to 64 KiB and the parser supports at most 64 headers;
+the setters can lower these limits for a connection or upstream response.
 - **`on_request`** will be called after parsing the request http with client and request information. It decides where to send this request (upstream) and it can do some request bending as well if needed.
 ```lua
 proxy:on_request("example.com", function(client, req)
     handler_resp = proxy:forward_http("127.0.0.1:8000")
     handler_resp:add_header("X_PROXY", "CONDUIT")
+    handler_resp:set_max_request_body_size(1048576)
+    handler_resp:set_max_response_body_size(1048576)
+    handler_resp:set_max_response_header_size(8192)
+    handler_resp:set_max_response_header_count(64)
+    handler_resp:set_connect_timeout(5)
+    handler_resp:set_client_body_timeout(30)
+    handler_resp:set_proxy_read_timeout(30)
     return handler_resp
 end)
 ```
+
+Request and response body-size limits are configured separately. Forward
+timeouts are total deadlines for connecting, relaying the request, and
+reading/relaying the response; passing `nil` disables a forward timeout.
 
 All this and other setting will go in `config.lua` as
 ```lua

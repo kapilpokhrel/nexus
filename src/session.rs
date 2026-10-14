@@ -1,15 +1,20 @@
 use crate::http::{self, MAX_HEADERS};
-use crate::lua_config::{Client, ForwardHttp, LuaConf, OnAcceptHandlerResp, OnRequestHandlerResp};
+use crate::lua_config::{
+    Client, ExpectHttp, ForwardHttp, LuaConf, OnAcceptHandlerResp, OnRequestHandlerResp,
+};
 use crate::net;
 use crate::relay::{relay_chunked, relay_until_eof, send_n, write_head};
 use crate::resolve;
 use monoio::io::AsyncWriteRentExt;
 use monoio::net::TcpStream;
+use monoio::time::{Instant, timeout_at};
+use std::future::Future;
 use std::io;
 use std::mem::MaybeUninit;
 use std::net::SocketAddr;
 use std::ops::Range;
 use std::rc::Rc;
+use std::time::Duration;
 
 #[derive(Clone, Copy)]
 enum BodyFraming {
@@ -25,6 +30,24 @@ struct HttpMessage<'a> {
     hdr_ranges: &'a [MaybeUninit<(Range<usize>, Range<usize>)>],
     read_len: usize,
     framing: BodyFraming,
+    max_body_size: usize,
+}
+
+fn deadline(timeout_seconds: Option<u64>) -> Option<Instant> {
+    timeout_seconds.map(|seconds| Instant::now() + Duration::from_secs(seconds))
+}
+
+async fn with_deadline<T>(
+    deadline: Option<Instant>,
+    future: impl Future<Output = io::Result<T>>,
+    message: &'static str,
+) -> io::Result<T> {
+    match deadline {
+        Some(deadline) => timeout_at(deadline, future)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, message))?,
+        None => future.await,
+    }
 }
 
 async fn relay_http_message(
@@ -40,7 +63,14 @@ async fn relay_http_message(
         hdr_ranges,
         read_len,
         framing,
+        max_body_size,
     } = message;
+    if matches!(framing, BodyFraming::ContentLength(size) if size > max_body_size) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "body exceeds configured size limit",
+        ));
+    }
     let body_prefix = match framing {
         BodyFraming::ContentLength(n) => read_len.saturating_sub(head.header_end).min(n),
         BodyFraming::None | BodyFraming::Chunked | BodyFraming::UntilEof => 0,
@@ -61,9 +91,13 @@ async fn relay_http_message(
             let already_read = read_len.saturating_sub(head.header_end);
             send_n(buf, src, dst, n.saturating_sub(already_read)).await
         }
-        BodyFraming::Chunked => relay_chunked(buf, head.header_end, read_len, src, dst).await,
+        BodyFraming::Chunked => {
+            relay_chunked(buf, head.header_end, read_len, src, dst, max_body_size).await
+        }
         BodyFraming::None => Ok(buf),
-        BodyFraming::UntilEof => relay_until_eof(buf, head.header_end, read_len, src, dst).await,
+        BodyFraming::UntilEof => {
+            relay_until_eof(buf, head.header_end, read_len, src, dst, max_body_size).await
+        }
     }
 }
 
@@ -85,8 +119,23 @@ pub async fn forward_http(
     client_req_read_len: usize,
     client_keepalive_requested: bool,
 ) -> io::Result<(Vec<u8>, bool)> {
+    if client_req_head
+        .content_len
+        .is_some_and(|size| size > forward_param.max_request_body_size)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "request body exceeds configured size limit",
+        ));
+    }
+
     // check out upstream connection
-    let mut backend = net::get_conn(&forward_param.upstream).await?;
+    let mut backend = with_deadline(
+        deadline(forward_param.connect_timeout.map(u64::from)),
+        net::get_conn(&forward_param.upstream),
+        "upstream connection timed out",
+    )
+    .await?;
     let request_is_head = buf[..client_req_head.start_of_header].starts_with(b"HEAD ");
 
     let (request_add_headers, request_remove_headers) = forward_param
@@ -102,24 +151,37 @@ pub async fn forward_http(
     } else {
         BodyFraming::None
     };
-    buf = relay_http_message(
-        client,
-        &mut backend,
-        HttpMessage {
-            buf,
-            head: client_req_head,
-            hdr_ranges: hdr_buf,
-            read_len: client_req_read_len,
-            framing: request_framing,
-        },
-        request_add_headers,
-        request_remove_headers,
+    buf = with_deadline(
+        deadline(forward_param.client_body_timeout.map(u64::from)),
+        relay_http_message(
+            client,
+            &mut backend,
+            HttpMessage {
+                buf,
+                head: client_req_head,
+                hdr_ranges: hdr_buf,
+                read_len: client_req_read_len,
+                framing: request_framing,
+                max_body_size: forward_param.max_request_body_size,
+            },
+            request_add_headers,
+            request_remove_headers,
+        ),
+        "client request body relay timed out",
     )
     .await?;
 
     // read upstream response head
-    let (b, upstream_head, _upstream_req_line, upstream_read_len) =
-        http::read_headers(buf, &mut backend, hdr_buf).await?;
+    let proxy_deadline = deadline(forward_param.proxy_read_timeout.map(u64::from));
+    let (b, upstream_head, _upstream_req_line, upstream_read_len) = http::read_headers(
+        buf,
+        &mut backend,
+        hdr_buf,
+        forward_param.max_response_header_size,
+        forward_param.max_response_header_count,
+        proxy_deadline,
+    )
+    .await?;
     buf = b;
     let upstream_status = response_status(&buf, &upstream_head);
     let response_has_no_body = request_is_head
@@ -152,18 +214,23 @@ pub async fn forward_http(
     } else {
         BodyFraming::UntilEof
     };
-    buf = relay_http_message(
-        &mut backend,
-        client,
-        HttpMessage {
-            buf,
-            head: &upstream_head,
-            hdr_ranges: hdr_buf,
-            read_len: upstream_read_len,
-            framing: response_framing,
-        },
-        &response_add_headers,
-        &response_remove_headers,
+    buf = with_deadline(
+        proxy_deadline,
+        relay_http_message(
+            &mut backend,
+            client,
+            HttpMessage {
+                buf,
+                head: &upstream_head,
+                hdr_ranges: hdr_buf,
+                read_len: upstream_read_len,
+                framing: response_framing,
+                max_body_size: forward_param.max_response_body_size,
+            },
+            &response_add_headers,
+            &response_remove_headers,
+        ),
+        "upstream response relay timed out",
     )
     .await?;
 
@@ -182,6 +249,7 @@ pub async fn handle_req(
 ) -> io::Result<()> {
     let client_t = Client::new(peer_addr.ip(), peer_addr.port());
 
+    let mut expect_http = ExpectHttp::default();
     let onaccept_handler_resp = resolve::run_on_accept(&state, &client_t)?;
     if let Some(resp) = onaccept_handler_resp {
         match resp {
@@ -198,7 +266,7 @@ pub async fn handle_req(
                 .await?;
                 return Ok(());
             }
-            _ => { /* continue */ }
+            OnAcceptHandlerResp::ExpectHttp(expect) => expect_http = expect,
         }
     }
 
@@ -210,8 +278,16 @@ pub async fn handle_req(
     // iteration is one full request/response exchange, reusing buf and hdr_buf
     loop {
         // read client request head
-        let (b, head, req_line, read_len) =
-            http::read_headers(buf, &mut client, &mut hdr_buf[..]).await?;
+        let header_deadline = deadline(Some(expect_http.header_timeout));
+        let (b, head, req_line, read_len) = http::read_headers(
+            buf,
+            &mut client,
+            &mut hdr_buf[..],
+            expect_http.max_header_size,
+            expect_http.max_header_count,
+            header_deadline,
+        )
+        .await?;
         buf = b;
 
         // build host + Request view

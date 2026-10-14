@@ -54,9 +54,22 @@ pub struct OnAcceptTlsBlock {
 pub struct ExpectHttp {
     pub max_header_size: usize,
     pub max_header_count: usize,
-    pub expected_method: Box<str>,
     pub header_timeout: u64,
     pub tls: OnAcceptTlsBlock,
+}
+
+impl Default for ExpectHttp {
+    fn default() -> Self {
+        Self {
+            max_header_size: 8192,
+            max_header_count: crate::http::MAX_HEADERS,
+            header_timeout: 5,
+            tls: OnAcceptTlsBlock {
+                enabled: false,
+                keyfile: "".into(),
+            },
+        }
+    }
 }
 
 impl_from_lua_exact_userdata!(ExpectHttp);
@@ -64,19 +77,21 @@ impl_from_lua_exact_userdata!(ExpectHttp);
 impl tealr::mlu::TealData for ExpectHttp {
     fn add_methods<F: tealr::mlu::TealDataMethods<Self>>(fields: &mut F) {
         fields.add_method_mut("set_max_header_size", |_, this, size: usize| {
-            if size == 0 {
-                return Err(LuaError::RuntimeError(
-                    "max_header_size must be greater than zero".into(),
-                ));
+            if size == 0 || size > crate::http::MAX_HEADER_SIZE {
+                return Err(LuaError::RuntimeError(format!(
+                    "max_header_size must be between 1 and {}",
+                    crate::http::MAX_HEADER_SIZE
+                )));
             }
             this.max_header_size = size;
             Ok(())
         });
         fields.add_method_mut("set_max_header_count", |_, this, count: usize| {
-            if count == 0 {
-                return Err(LuaError::RuntimeError(
-                    "max_header_count must be greater than zero".into(),
-                ));
+            if count == 0 || count > crate::http::MAX_HEADERS {
+                return Err(LuaError::RuntimeError(format!(
+                    "max_header_count must be between 1 and {}",
+                    crate::http::MAX_HEADERS
+                )));
             }
             this.max_header_count = count;
             Ok(())
@@ -88,15 +103,6 @@ impl tealr::mlu::TealData for ExpectHttp {
                 ));
             }
             this.header_timeout = timeout;
-            Ok(())
-        });
-        fields.add_method_mut("set_expected_method", |_, this, method: String| {
-            if !method.is_empty() && !valid_header_name(&method) {
-                return Err(LuaError::RuntimeError(
-                    "expected_method must be a valid HTTP token".into(),
-                ));
-            }
-            this.expected_method = method.into();
             Ok(())
         });
         fields.add_method_mut("set_tls", |_, this, tls_keyfile: String| {
@@ -235,7 +241,11 @@ impl HeaderPatchBlock {
 #[derive(Debug, Clone, tealr::mlu::UserData, ToTypename)]
 pub struct ForwardHttp {
     pub upstream: String,
-    pub max_body_size: usize,
+    pub max_request_body_size: usize,
+    pub max_response_body_size: usize,
+    pub max_response_header_size: usize,
+    pub max_response_header_count: usize,
+    pub connect_timeout: Option<u32>,
     pub proxy_read_timeout: Option<u32>,
     pub client_body_timeout: Option<u32>,
     pub cache: Option<RespCacheBlock>,
@@ -247,13 +257,51 @@ impl_from_lua_exact_userdata!(ForwardHttp);
 
 impl tealr::mlu::TealData for ForwardHttp {
     fn add_methods<F: TealDataMethods<Self>>(methods: &mut F) {
-        methods.add_method_mut("set_max_body_size", |_, this, size: usize| {
+        methods.add_method_mut("set_max_request_body_size", |_, this, size: usize| {
             if size == 0 {
                 return Err(LuaError::RuntimeError(
-                    "max_body_size must be greater than zero".into(),
+                    "max_request_body_size must be greater than zero".into(),
                 ));
             }
-            this.max_body_size = size;
+            this.max_request_body_size = size;
+            Ok(())
+        });
+        methods.add_method_mut("set_max_response_body_size", |_, this, size: usize| {
+            if size == 0 {
+                return Err(LuaError::RuntimeError(
+                    "max_response_body_size must be greater than zero".into(),
+                ));
+            }
+            this.max_response_body_size = size;
+            Ok(())
+        });
+        methods.add_method_mut("set_max_response_header_size", |_, this, size: usize| {
+            if size == 0 || size > crate::http::MAX_HEADER_SIZE {
+                return Err(LuaError::RuntimeError(format!(
+                    "max_response_header_size must be between 1 and {}",
+                    crate::http::MAX_HEADER_SIZE
+                )));
+            }
+            this.max_response_header_size = size;
+            Ok(())
+        });
+        methods.add_method_mut("set_max_response_header_count", |_, this, count: usize| {
+            if count == 0 || count > crate::http::MAX_HEADERS {
+                return Err(LuaError::RuntimeError(format!(
+                    "max_response_header_count must be between 1 and {}",
+                    crate::http::MAX_HEADERS
+                )));
+            }
+            this.max_response_header_count = count;
+            Ok(())
+        });
+        methods.add_method_mut("set_connect_timeout", |_, this, timeout: Option<u32>| {
+            if timeout == Some(0) {
+                return Err(LuaError::RuntimeError(
+                    "connect_timeout must be greater than zero".into(),
+                ));
+            }
+            this.connect_timeout = timeout;
             Ok(())
         });
         methods.add_method_mut("set_proxy_read_timeout", |_, this, timeout: Option<u32>| {

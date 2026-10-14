@@ -195,13 +195,25 @@ pub async fn relay_chunked(
     mut valid: usize,
     src: &mut TcpStream,
     dst: &mut TcpStream,
+    max_body_size: usize,
 ) -> io::Result<Vec<u8>> {
+    let mut body_size = 0usize;
     loop {
         // chunk-size line, e.g. "1a\r\n", or "0\r\n" for the last chunk
         let (b, v, line_end) = find_crlf(buf, pos, valid, src).await?;
         buf = b;
         valid = v;
         let size = parse_chunk_size(&buf[pos..line_end])?;
+        if body_size
+            .checked_add(size)
+            .is_none_or(|size| size > max_body_size)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunked body exceeds configured size limit",
+            ));
+        }
+        body_size += size;
         let data_start = line_end + 2;
 
         let (b, p, v) = relay_span(buf, pos, valid, data_start - pos, src, dst).await?;
@@ -214,7 +226,10 @@ pub async fn relay_chunked(
         }
 
         // chunk-data followed by its trailing CRLF
-        let (b, p, v) = relay_span(buf, pos, valid, size + 2, src, dst).await?;
+        let chunk_span = size
+            .checked_add(2)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "chunk size is too large"))?;
+        let (b, p, v) = relay_span(buf, pos, valid, chunk_span, src, dst).await?;
         buf = b;
         pos = p;
         valid = v;
@@ -228,8 +243,16 @@ pub async fn relay_until_eof(
     valid: usize,
     src: &mut TcpStream,
     dst: &mut TcpStream,
+    max_body_size: usize,
 ) -> io::Result<Vec<u8>> {
     let buffered = valid.saturating_sub(start);
+    if buffered > max_body_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "body exceeds configured size limit",
+        ));
+    }
+    let mut body_size = buffered;
     buf = fwd(buf, dst, buffered, start).await?;
     loop {
         if buf.is_empty() {
@@ -244,6 +267,16 @@ pub async fn relay_until_eof(
         if n == 0 {
             return Ok(buf);
         }
+        if body_size
+            .checked_add(n)
+            .is_none_or(|size| size > max_body_size)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "body exceeds configured size limit",
+            ));
+        }
+        body_size += n;
         let (res, view) = dst.write_all(buf.slice(..n)).await;
         buf = view.into_inner();
         res?;

@@ -11,7 +11,7 @@ mod handles;
 
 pub use handler_response::{
     CustomHttpResponse, Deny, ExpectHttp, ForwardHttp, OnAcceptFn, OnAcceptHandlerResp,
-    OnAcceptTlsBlock, OnRequestFn, OnRequestHandlerResp,
+    OnRequestFn, OnRequestHandlerResp,
 };
 pub use handles::{Client, ClientHandle, HandleFactory, Request, RequestHandle};
 
@@ -156,7 +156,11 @@ impl TealData for Proxy {
             }
             let resp = ForwardHttp {
                 upstream,
-                max_body_size: 1048576,
+                max_request_body_size: 1048576,
+                max_response_body_size: 1048576,
+                max_response_header_size: 8192,
+                max_response_header_count: 64,
+                connect_timeout: Some(5),
                 proxy_read_timeout: Some(30),
                 client_body_timeout: Some(30),
                 cache: None,
@@ -167,19 +171,7 @@ impl TealData for Proxy {
             //lua.create_userdata(resp)
         });
 
-        methods.add_method("expect_http", |_lua, _, _: ()| {
-            let resp = ExpectHttp {
-                max_header_size: 8192,
-                max_header_count: 64,
-                expected_method: "".into(),
-                header_timeout: 5,
-                tls: OnAcceptTlsBlock {
-                    enabled: false,
-                    keyfile: "".into(),
-                },
-            };
-            Ok(resp)
-        });
+        methods.add_method("expect_http", |_lua, _, _: ()| Ok(ExpectHttp::default()));
 
         methods.add_method("deny", |_lua, _, reason: String| {
             let resp = Deny {
@@ -263,6 +255,9 @@ mod tests {
                     assert(not pcall(function()
                         response:add_header("Content-Length", "1")
                     end))
+                    assert(not pcall(function()
+                        response:set_max_response_header_size(65537)
+                    end))
 
                     local request = proxy:forward_http("127.0.0.1:8000")
                     assert(not pcall(function() request:add_header("Bad Header", "value") end))
@@ -270,6 +265,11 @@ mod tests {
                     return response
                 end
                 handler_resp = proxy:forward_http("127.0.0.1:8000")
+                handler_resp:set_max_request_body_size(1048576)
+                handler_resp:set_max_response_body_size(1048576)
+                handler_resp:set_max_response_header_size(8192)
+                handler_resp:set_max_response_header_count(64)
+                handler_resp:set_connect_timeout(5)
                 handler_resp:set_cache(60, "$url")
                 return handler_resp
             end)
@@ -279,9 +279,14 @@ mod tests {
                 if client.ip == "10.100.1.1" then
                     local handler_resp = proxy:expect_http()
                     handler_resp:set_max_header_size(16384)
-                    handler_resp:set_max_header_count(128)
-                    handler_resp:set_expected_method("GET")
+                    handler_resp:set_max_header_count(64)
                     handler_resp:set_tls("/path/to/keyfile")
+                    assert(not pcall(function()
+                        handler_resp:set_max_header_count(65)
+                    end))
+                    assert(not pcall(function()
+                        handler_resp:set_max_header_size(65537)
+                    end))
                     return handler_resp
 
                 elseif client.ip == "192.168.1.1" then
