@@ -1,10 +1,10 @@
-# Conduit
+# Nexus
 
 > [!NOTE]
 > Curretly, it is in a highly experimental state.
 > We have only implemented the things that are the core of our idea. io_uring proxy with lua.
 
-Conduit is the implementation of our idea; having a lua native configuration in a reverse proxy.
+Nexus is the implementation of our idea; having a lua native configuration in a reverse proxy.
 We imagined having a programmable and dynamic deciding layer direcly in the reverse proxy path is kinda cool and we can achieve many thing direcly from reverse proxy without ever talking to the backend. In that sense, it is true but we have also realized that trying to do so much in highly concurrent hot path like in our proxy core is not much of a great idea. Still, having lua is pretty cool and it is faily cheap. For a simple configuration that just tells what to do and does't do much by itself, it is pretty fast and only adds a little overhead.
 Concurrency curves below shows that requets per second only decreases by little bit on adding lua.
 
@@ -28,7 +28,7 @@ On top of lua, our implementation uses monoio with io_uring backend drastically 
 |   epoll_wait   |        0.18 /req     |
 |   **TOTAL**    |        **5.19 /req** |
 
-### Conduit Syscalls
+### Nexus Syscalls
 
 | Major syscalls | syscalls per request |
 |----------------|----------------------|
@@ -42,7 +42,7 @@ On top of lua, our implementation uses monoio with io_uring backend drastically 
 
 Here's the sequence you should know before you use this.
 
-![Conduit Sequence Diagram](assets/conduit_sequence.png)
+![Nexus Sequence Diagram](assets/nexus_sequence.png)
 
 - **`on_accept`:** will be called after accepting a connection from client, before any http parsing. It mainly decides whether to let this request through or not Or should it be redirected? (Optional)
 ```lua
@@ -65,7 +65,7 @@ the setters can lower these limits for a connection or upstream response.
 ```lua
 proxy:on_request("example.com", function(client, req)
     handler_resp = proxy:forward_http("127.0.0.1:8000")
-    handler_resp:add_header("X_PROXY", "CONDUIT")
+    handler_resp:add_header("X_PROXY", "NEXUS")
     handler_resp:set_max_request_body_size(1048576)
     handler_resp:set_max_response_body_size(1048576)
     handler_resp:set_max_response_header_size(8192)
@@ -103,7 +103,7 @@ If you wish to take a peek into our thought process, design and notes, they live
 The `proxy` API is described by the Rust types themselves so that docs can't drift.
 
 Every type Lua can see implements tealr's `TealData`, and `main.rs` walks them at
-startup with `TypeWalker`, writing the result to `conduit.json`:
+startup with `TypeWalker`, writing the result to `nexus.json`:
 
 ```rust
 TypeWalker::new()
@@ -118,7 +118,7 @@ browsable docs and type definitions:
 
 ```
 cargo install tealr_doc_gen     # once
-./target/release/conduit        # refreshes conduit.json
+./target/release/nexus          # refreshes nexus.json
 tealr_doc_gen run               # writes pages/
 ```
 
@@ -126,4 +126,4 @@ tealr_doc_gen run               # writes pages/
 
 ![Lua API Docs screenshot](assets/docs_screenshot.png)
 
-- *`pages/definitions/conduit.d.tl`* is a Teal for completion and type checking in config.lua
+- *`pages/definitions/nexus.d.tl`* is a Teal for completion and type checking in config.lua

@@ -33,7 +33,7 @@ async fn main() {
         .process_type::<ForwardHttp>();
 
     if let Ok(json) = types.to_json() {
-        if fs::write("conduit.json", json).is_err() {
+        if fs::write("nexus.json", json).is_err() {
             log::error!("Teal doc json write failed");
         }
     } else {

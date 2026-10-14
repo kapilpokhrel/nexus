@@ -1,5 +1,5 @@
 target
-conduit.json
+nexus.json
 profile.json.gz
 pages
 benches/results

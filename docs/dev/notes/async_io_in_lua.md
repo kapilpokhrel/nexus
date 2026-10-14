@@ -22,7 +22,7 @@ sleeptest.sleep = function(ms)
     if BLOCKING then
         socket.sleep(ms / 1000)
     else
-        conduit.sleep(ms)
+        nexus.sleep(ms)
     end
 end
 

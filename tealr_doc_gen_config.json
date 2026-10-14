@@ -2,7 +2,7 @@
   "doc_template": "Builtin",
   "page_root": "",
   "store_in": "pages",
-  "name": "conduit",
+  "name": "nexus",
   "type_def_files": {
     "runner": "Builtin",
     "templates": {

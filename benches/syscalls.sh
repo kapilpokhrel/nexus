@@ -2,7 +2,7 @@
 #
 # Syscalls per request, for the steady-state request path.
 #
-#   benches/syscalls.sh conduit
+#   benches/syscalls.sh nexus
 #   benches/syscalls.sh nginx
 #   benches/syscalls.sh both
 
@@ -15,7 +15,7 @@ MIN=${MIN:-0.01}          # hide syscalls below this many per request
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SCRIPT=$ROOT/benches/wrk_script.lua
-OUT=/tmp/conduit-syscalls
+OUT=/tmp/nexus-syscalls
 
 die() { echo "error: $*" >&2; exit 1; }
 
@@ -43,7 +43,7 @@ measure() {                       # measure <label> <port> <cmd...>
     reqs=$(echo "$out" | grep -oP '[0-9]+(?= requests in)')
 
     pkill -x nginx 2>/dev/null
-    pkill -x conduit 2>/dev/null
+    pkill -x nexus 2>/dev/null
     sleep 2
 
     [ -n "${reqs:-}" ] || die "wrk reported no requests for $label"
@@ -59,9 +59,9 @@ measure() {                       # measure <label> <port> <cmd...>
         END { printf "   %-18s %6.2f /req\n", "TOTAL", t/n }' "$trace"
 }
 
-conduit() {
-    [ -x "$ROOT/target/release/conduit" ] || die "build first: cargo build --release"
-    measure conduit 5000 "$ROOT/target/release/conduit"
+nexus() {
+    [ -x "$ROOT/target/release/nexus" ] || die "build first: cargo build --release"
+    measure nexus 5000 "$ROOT/target/release/nexus"
 }
 
 nginx_() {
@@ -71,10 +71,10 @@ nginx_() {
 }
 
 case "${1:-both}" in
-    conduit) conduit ;;
+    nexus)   nexus ;;
     nginx)   nginx_ ;;
-    both)    conduit; nginx_ ;;
-    *) die "usage: $0 [conduit|nginx|both]" ;;
+    both)    nexus; nginx_ ;;
+    *) die "usage: $0 [nexus|nginx|both]" ;;
 esac
 
 printf '\ntraces kept in %s\n' "$OUT"
