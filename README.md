@@ -1,7 +1,7 @@
 # Nexus
 
 > [!NOTE]
-> Curretly, it is in a highly experimental state.
+> This is an experimental project.
 > We have only implemented the things that are the core of our idea. io_uring proxy with lua.
 
 Nexus is the implementation of our idea; having a lua native configuration in a reverse proxy.
@@ -41,6 +41,13 @@ On top of lua, our implementation uses monoio with io_uring backend drastically 
 ## Usage
 
 Here's the sequence you should know before you use this.
+
+Build and run on a Linux system with `io_uring` support. Nexus loads `config.lua`
+from the current working directory, so keep it in the directory you run Nexus from:
+```sh
+cargo build --release
+./target/release/nexus
+```
 
 ![Nexus Sequence Diagram](assets/nexus_sequence.png)
 
@@ -95,6 +102,24 @@ end)
 Relative file paths are resolved from the process working directory. Files are
 streamed as `application/octet-stream`; the response includes the file size,
 closes the client connection, and omits the body for `HEAD` requests.
+
+Lua functions can live in other files and be loaded with `require`. Use
+`proxy:cached_call` to cache a function's result by host and key for a number
+of seconds:
+```lua
+local iploc = require("iploc")
+
+proxy:on_request("example.com", function(client, req)
+    local handler_resp = proxy:forward_http("127.0.0.1:8000")
+    handler_resp:add_header("COUNTRY", proxy:cached_call(
+        "example.com",
+        proxy:cache_param(60, client.ip),
+        iploc.get_country,
+        client.ip
+    ))
+    return handler_resp
+end)
+```
 
 All this and other setting will go in `config.lua` as
 ```lua
