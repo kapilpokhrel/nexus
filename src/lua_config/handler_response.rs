@@ -202,6 +202,15 @@ impl tealr::mlu::TealData for CustomHttpResponse {
     }
 }
 
+#[derive(Debug, Clone, tealr::mlu::UserData, ToTypename)]
+pub struct FileResponse {
+    pub path: String,
+}
+
+impl_from_lua_exact_userdata!(FileResponse);
+
+impl TealData for FileResponse {}
+
 create_union_mlua!(pub enum OnAcceptHandlerResp = Deny | ExpectHttp | CustomHttpResponse);
 
 impl std::fmt::Debug for OnAcceptHandlerResp {
@@ -371,7 +380,7 @@ impl tealr::mlu::TealData for ForwardHttp {
     }
 }
 
-create_union_mlua!(pub enum OnRequestHandlerResp = ForwardHttp | Deny | CustomHttpResponse);
+create_union_mlua!(pub enum OnRequestHandlerResp = ForwardHttp | Deny | CustomHttpResponse | FileResponse);
 
 impl std::fmt::Debug for OnRequestHandlerResp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -380,6 +389,9 @@ impl std::fmt::Debug for OnRequestHandlerResp {
             OnRequestHandlerResp::Deny(x) => f.debug_tuple("Deny").field(x).finish(),
             OnRequestHandlerResp::CustomHttpResponse(x) => {
                 f.debug_tuple("CustomHttpResponse").field(x).finish()
+            }
+            OnRequestHandlerResp::FileResponse(x) => {
+                f.debug_tuple("FileResponse").field(x).finish()
             }
         }
     }

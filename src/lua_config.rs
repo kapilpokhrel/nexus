@@ -10,8 +10,8 @@ mod handler_response;
 mod handles;
 
 pub use handler_response::{
-    CustomHttpResponse, Deny, ExpectHttp, ForwardHttp, OnAcceptFn, OnAcceptHandlerResp,
-    OnRequestFn, OnRequestHandlerResp,
+    CustomHttpResponse, Deny, ExpectHttp, FileResponse, ForwardHttp, OnAcceptFn,
+    OnAcceptHandlerResp, OnRequestFn, OnRequestHandlerResp,
 };
 pub use handles::{Client, ClientHandle, HandleFactory, Request, RequestHandle};
 
@@ -188,6 +188,15 @@ impl TealData for Proxy {
                 body: String::new(),
             })
         });
+
+        methods.add_method("file_response", |_lua, _, path: String| {
+            if path.is_empty() {
+                return Err(mlua::Error::RuntimeError(
+                    "file_response: path cannot be empty".into(),
+                ));
+            }
+            Ok(FileResponse { path })
+        });
     }
 }
 
@@ -230,7 +239,7 @@ mod tests {
     fn register_handler() -> LuaResult<()> {
         let req = Request::from_parts(
             "GET",
-            "path",
+            "/path?item=one&item=two",
             &[("Host", "example.com"), ("ContentLength", "64")],
         );
 
@@ -243,6 +252,13 @@ mod tests {
             proxy:on_request("example.com", function(client, req)
                 print("Request from", client.ip, client.port)
                 print(req.method, req.path)
+                if req.path == "/path" then
+                    assert(req.query == "item=one&item=two")
+                end
+                if req.path == "/file" then
+                    assert(req.query == nil)
+                    return proxy:file_response("README.md")
+                end
                 if client.ip == "127.0.0.1" then
                     local response = proxy:custom_http_response()
                     response:set_status(201)
@@ -348,7 +364,20 @@ mod tests {
             .get("example.com")
             .unwrap()
             .call::<OnRequestHandlerResp>((&handle_ud.client_ud, &handle_ud.req_ud));
+        assert!(matches!(
+            resp,
+            Ok(OnRequestHandlerResp::CustomHttpResponse(_))
+        ));
         println!("{:?}", resp);
+
+        handle_ud.set_req(Request::from_parts("GET", "/file", &[]));
+        let resp = lua_state
+            .req_handlers
+            .borrow()
+            .get("example.com")
+            .unwrap()
+            .call::<OnRequestHandlerResp>((&handle_ud.client_ud, &handle_ud.req_ud))?;
+        assert!(matches!(resp, OnRequestHandlerResp::FileResponse(_)));
 
         Ok(())
     }

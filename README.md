@@ -81,6 +81,21 @@ Request and response body-size limits are configured separately. Forward
 timeouts are total deadlines for connecting, relaying the request, and
 reading/relaying the response; passing `nil` disables a forward timeout.
 
+`req.path` does not include the query string; `req.query` contains it without
+the leading `?`, or is `nil` if the request has no query. An `on_request`
+handler can return a file directly instead of forwarding:
+```lua
+proxy:on_request("example.com", function(client, req)
+    if req.path == "/about" then
+        return proxy:file_response("public/about.html")
+    end
+    return proxy:forward_http("127.0.0.1:8000")
+end)
+```
+Relative file paths are resolved from the process working directory. Files are
+streamed as `application/octet-stream`; the response includes the file size,
+closes the client connection, and omits the body for `HEAD` requests.
+
 All this and other setting will go in `config.lua` as
 ```lua
 -- proxy:on_accept skipped

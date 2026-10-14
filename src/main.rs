@@ -6,8 +6,8 @@ mod resolve;
 mod session;
 
 use crate::lua_config::{
-    CacheParam, ClientHandle, CustomHttpResponse, Deny, ExpectHttp, ForwardHttp, LuaConf, Proxy,
-    RequestHandle,
+    CacheParam, ClientHandle, CustomHttpResponse, Deny, ExpectHttp, FileResponse, ForwardHttp,
+    LuaConf, Proxy, RequestHandle,
 };
 use mlua::prelude::*;
 use monoio::net::TcpListener;
@@ -30,6 +30,7 @@ async fn main() {
         .process_type::<ExpectHttp>()
         .process_type::<Deny>()
         .process_type::<CustomHttpResponse>()
+        .process_type::<FileResponse>()
         .process_type::<ForwardHttp>();
 
     if let Ok(json) = types.to_json() {

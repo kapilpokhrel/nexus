@@ -120,6 +120,7 @@ pub struct RequestInner {
     head: Box<[u8]>,
     method: Range<usize>,
     path: Range<usize>,
+    query: Option<Range<usize>>,
     headers: Vec<(Range<usize>, Range<usize>)>,
 }
 
@@ -135,6 +136,10 @@ impl RequestInner {
 
     pub fn path(&self) -> &str {
         self.at(&self.path)
+    }
+
+    pub fn query(&self) -> Option<&str> {
+        self.query.as_ref().map(|query| self.at(query))
     }
 
     pub fn header(&self, name: &str) -> Option<&str> {
@@ -157,12 +162,14 @@ impl Request {
         head: &[u8],
         method: Range<usize>,
         path: Range<usize>,
+        query: Option<Range<usize>>,
         headers: Vec<(Range<usize>, Range<usize>)>,
     ) -> Self {
         Self(Arc::new(RequestInner {
             head: head.into(),
             method,
             path,
+            query,
             headers,
         }))
     }
@@ -175,7 +182,13 @@ impl Request {
         head.push(b' ');
         let p_start = head.len();
         head.extend_from_slice(path.as_bytes());
-        let p = p_start..head.len();
+        let target = p_start..head.len();
+        let query_start = head[target.clone()]
+            .iter()
+            .position(|&byte| byte == b'?')
+            .map(|index| target.start + index);
+        let p = target.start..query_start.unwrap_or(target.end);
+        let query = query_start.map(|start| start + 1..target.end);
         head.extend_from_slice(b" HTTP/1.1\r\n");
         let mut hs = Vec::with_capacity(headers.len());
         for (n, v) in headers {
@@ -188,7 +201,7 @@ impl Request {
             hs.push((nr, v_start..head.len()));
             head.extend_from_slice(b"\r\n");
         }
-        Request::new(&head, m, p, hs)
+        Request::new(&head, m, p, query, hs)
     }
 }
 
@@ -209,6 +222,15 @@ impl tealr::mlu::TealData for RequestHandle {
                 LuaError::RuntimeError("request handle is no longer valid".to_string())
             })?;
             lua.create_string(req.0.path())
+        });
+        fields.add_field_method_get("query", |lua, this| {
+            let req = this.0.borrow().req.clone().ok_or_else(|| {
+                LuaError::RuntimeError("request handle is no longer valid".to_string())
+            })?;
+            req.0
+                .query()
+                .map(|query| lua.create_string(query))
+                .transpose()
         });
         fields.add_field_method_get("headers", |lua, this| {
             let req = this.0.borrow().req.clone().ok_or_else(|| {

@@ -1,10 +1,12 @@
 use crate::http::{self, MAX_HEADERS};
 use crate::lua_config::{
-    Client, ExpectHttp, ForwardHttp, LuaConf, OnAcceptHandlerResp, OnRequestHandlerResp,
+    Client, ExpectHttp, FileResponse, ForwardHttp, LuaConf, OnAcceptHandlerResp,
+    OnRequestHandlerResp,
 };
 use crate::net;
 use crate::relay::{relay_chunked, relay_until_eof, send_n, write_head};
 use crate::resolve;
+use monoio::buf::{IoBuf, IoBufMut};
 use monoio::io::AsyncWriteRentExt;
 use monoio::net::TcpStream;
 use monoio::time::{Instant, timeout_at};
@@ -294,6 +296,7 @@ pub async fn handle_req(
         let (host, req) = http::host_and_request(&buf, &hdr_buf, &head, &req_line)
             .map_err(|e| io::Error::new(e.kind(), format!("client {peer_addr}: {e}")))?;
         let keep_alive_requested = http::client_wants_keep_alive(&buf, &req_line, &req);
+        let request_is_head = req.0.method().eq_ignore_ascii_case("HEAD");
 
         // decide
         let Some(on_request_handler_resp) =
@@ -316,6 +319,10 @@ pub async fn handle_req(
                     resp.body.as_bytes(),
                 )
                 .await?;
+                return Ok(());
+            }
+            OnRequestHandlerResp::FileResponse(file_response) => {
+                send_file_response(&mut client, file_response, request_is_head).await?;
                 return Ok(());
             }
             OnRequestHandlerResp::ForwardHttp(fwd_param) => {
@@ -390,4 +397,66 @@ pub async fn send_custom_http_response<K: AsRef<str>>(
 
     let (result, _) = client.write_all(response).await;
     result.map(|_| ())
+}
+
+pub async fn send_file_response(
+    client: &mut TcpStream,
+    file_response: FileResponse,
+    head_only: bool,
+) -> io::Result<()> {
+    let file = match monoio::fs::File::open(file_response.path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return send_custom_http_response(
+                client,
+                404,
+                "Not Found",
+                &[("Content-Type", "text/plain; charset=utf-8")],
+                b"Not Found",
+            )
+            .await;
+        }
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata().await?;
+    if !metadata.is_file() {
+        return send_custom_http_response(
+            client,
+            404,
+            "Not Found",
+            &[("Content-Type", "text/plain; charset=utf-8")],
+            b"Not Found",
+        )
+        .await;
+    }
+    let file_size = metadata.len();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {file_size}\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes();
+    let (result, _) = client.write_all(response).await;
+    result?;
+
+    if head_only {
+        return Ok(());
+    }
+
+    let mut offset = 0;
+    while offset < file_size {
+        let buffer = vec![0; 64 * 1024];
+        let (result, buffer) = file.read_at(buffer.slice_mut(..), offset).await;
+        let bytes_read = result?;
+        let buffer = buffer.into_inner();
+        if bytes_read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "file changed while sending response",
+            ));
+        }
+        let (result, _) = client.write_all(buffer.slice(..bytes_read)).await;
+        result?;
+        offset += bytes_read as u64;
+    }
+
+    Ok(())
 }

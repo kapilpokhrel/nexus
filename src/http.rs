@@ -24,12 +24,26 @@ pub struct RequestInfo {
     pub host: Option<Range<usize>>,
     pub method: Option<Range<usize>>,
     pub path: Option<Range<usize>>,
+    pub query: Option<Range<usize>>,
     pub version: Option<Range<usize>>,
 }
 
 pub fn range_of(buf: &[u8], sub: &[u8]) -> Range<usize> {
     let start = sub.as_ptr() as usize - buf.as_ptr() as usize;
     start..start + sub.len()
+}
+
+fn split_request_target(
+    target_bytes: &[u8],
+    target: Range<usize>,
+) -> (Range<usize>, Option<Range<usize>>) {
+    let query_start = target_bytes[target.clone()]
+        .iter()
+        .position(|&byte| byte == b'?')
+        .map(|index| target.start + index);
+    let path = target.start..query_start.unwrap_or(target.end);
+    let query = query_start.map(|start| start + 1..target.end);
+    (path, query)
 }
 
 pub fn host_and_request<'a>(
@@ -71,6 +85,14 @@ pub fn host_and_request<'a>(
             format!("invalid request path: {e}"),
         )
     })?;
+    if let Some(query) = &req_line.query {
+        std::str::from_utf8(&buf[query.clone()]).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid request query: {e}"),
+            )
+        })?;
+    }
 
     let n = head.header_count.min(MAX_HEADERS);
     let mut headers = Vec::with_capacity(n);
@@ -96,6 +118,7 @@ pub fn host_and_request<'a>(
             &buf[..head.header_end],
             method.clone(),
             path.clone(),
+            req_line.query.clone(),
             headers,
         ),
     ))
@@ -202,7 +225,7 @@ pub async fn read_headers(
                     .map(|h| range_of(&buf, h.value));
                 let h_count = parsed.len();
 
-                let (method, path, version) = {
+                let (method, path, query, version) = {
                     let req = &buf[..se - 2];
                     let sp1 = req.iter().position(|&b| b == b' ');
                     let sp2 = sp1.and_then(|i| {
@@ -213,9 +236,11 @@ pub async fn read_headers(
                     });
                     match (sp1, sp2) {
                         (Some(e), Some(s)) if !req[..e].contains(&b'/') => {
-                            (Some(0..e), Some(e + 1..s), Some(s + 1..req.len()))
+                            let target_start = e + 1;
+                            let (path, query) = split_request_target(req, target_start..s);
+                            (Some(0..e), Some(path), query, Some(s + 1..req.len()))
                         }
-                        _ => (None, None, None),
+                        _ => (None, None, None, None),
                     }
                 };
 
@@ -232,6 +257,7 @@ pub async fn read_headers(
                         host,
                         method,
                         path,
+                        query,
                         version,
                     },
                     ptr,
@@ -284,6 +310,7 @@ mod tests {
             host: None,
             method: Some(0..3),
             path: Some(4..5),
+            query: None,
             version: Some(6..14),
         };
         let hdr = [const { MaybeUninit::uninit() }; MAX_HEADERS];
@@ -294,12 +321,21 @@ mod tests {
     }
 
     #[test]
+    fn splits_query_from_request_path() {
+        let request_line = b"GET /api?q=1 HTTP/1.1";
+        let (path, query) = split_request_target(request_line, 4..12);
+        assert_eq!(&request_line[path], b"/api");
+        assert_eq!(&request_line[query.unwrap()], b"q=1");
+    }
+
+    #[test]
     fn missing_method_is_an_error() {
         let buf = b"GET / HTTP/1.1\r\n";
         let req_line = RequestInfo {
             host: Some(0..3),
             method: None,
             path: Some(4..5),
+            query: None,
             version: Some(6..14),
         };
         let hdr = [const { MaybeUninit::uninit() }; MAX_HEADERS];
