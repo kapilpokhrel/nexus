@@ -85,6 +85,8 @@ impl Proxy {
 
 impl TealData for Proxy {
     fn add_methods<M: TealDataMethods<Self>>(methods: &mut M) {
+        methods.document_type("Proxy is the main interface for configuring the proxy server. It allows you to set up request handlers, accept handlers, and configure various aspects of the proxy's behavior.");
+        methods.document("listen_on(address) sets the address and port on which the proxy server will listen for incoming connections. The address should be in the format 'IP:PORT'.");
         methods.add_method_mut("listen_on", |_, this, addr: String| {
             this.listen_addr = addr.into();
             // other validity checks required too
@@ -97,6 +99,7 @@ impl TealData for Proxy {
             }
         });
 
+        methods.document("cached_call(host, cache_info, func, args) calls the given Lua function with the provided arguments and caches the result based on the specified host and cache parameters. If a cached result exists and is still valid, it returns the cached value instead of calling the function again.");
         methods.add_method_mut(
             "cached_call",
             |_,
@@ -131,6 +134,7 @@ impl TealData for Proxy {
             },
         );
 
+        methods.document("on_request(host, func) registers a request handler function for the specified host. The function will be called whenever a request is received for that host. The function should accept two arguments: a ClientHandle and a RequestHandle, and it should return an appropriate response.");
         methods.add_method_mut("on_request", |_, this, (host, f): (String, OnRequestFn)| {
             // other validity checks can be added here, like valid host format, etc.
             if host.is_empty() {
@@ -142,11 +146,13 @@ impl TealData for Proxy {
             Ok(())
         });
 
+        methods.document("on_accept(func) registers an accept handler function that will be called whenever a new client connection is accepted. The function should accept a ClientHandle and return an appropriate response.");
         methods.add_method_mut("on_accept", |_, this, f: OnAcceptFn| {
             this.on_accept_fn.replace(Some(f.into()));
             Ok(())
         });
 
+        methods.document("forward_http(upstream) creates a ForwardHttp response that forwards the request to the specified upstream server. The upstream parameter should be a valid address in the format 'IP:PORT'.");
         methods.add_method("forward_http", |_lua, _, upstream: String| {
             // same as previous; other validity checks required
             if upstream.is_empty() {
@@ -171,8 +177,10 @@ impl TealData for Proxy {
             //lua.create_userdata(resp)
         });
 
+        methods.document("expect_http() creates an ExpectHttp response for on_accept that expects an HTTP request from the client. This can be used to enforce that the client sends a valid HTTP request before proceeding with further processing.");
         methods.add_method("expect_http", |_lua, _, _: ()| Ok(ExpectHttp::default()));
 
+        methods.document("deny(reason) creates a Deny response that denies the connection with the specified reason. The reason should be a string explaining why the connection is denied. Rignt now it just closes the connection silently");
         methods.add_method("deny", |_lua, _, reason: String| {
             let resp = Deny {
                 reason: reason.into(),

@@ -217,6 +217,7 @@ impl tealr::mlu::TealData for RequestHandle {
             })?;
             lua.create_string(req.0.method())
         });
+        fields.document("path is the request path, excluding the query string");
         fields.add_field_method_get("path", |lua, this| {
             let req = this.0.borrow().req.clone().ok_or_else(|| {
                 LuaError::RuntimeError("request handle is no longer valid".to_string())
@@ -232,6 +233,7 @@ impl tealr::mlu::TealData for RequestHandle {
                 .map(|query| lua.create_string(query))
                 .transpose()
         });
+        fields.document("header is a table of request headers, with header names as keys and header values as values");
         fields.add_field_method_get("headers", |lua, this| {
             let req = this.0.borrow().req.clone().ok_or_else(|| {
                 LuaError::RuntimeError("request handle is no longer valid".to_string())
@@ -244,6 +246,7 @@ impl tealr::mlu::TealData for RequestHandle {
         });
     }
     fn add_methods<M: TealDataMethods<Self>>(methods: &mut M) {
+        methods.document("header(name) returns the value of the request header with the given name, or nil if the header is not present");
         methods.add_method("header", |_, this, h: String| {
             let req = this.0.borrow().req.clone().ok_or_else(|| {
                 LuaError::RuntimeError("request handle is no longer valid".to_string())

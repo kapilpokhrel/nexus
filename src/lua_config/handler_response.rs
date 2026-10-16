@@ -76,6 +76,8 @@ impl_from_lua_exact_userdata!(ExpectHttp);
 
 impl tealr::mlu::TealData for ExpectHttp {
     fn add_methods<F: tealr::mlu::TealDataMethods<Self>>(fields: &mut F) {
+        fields.document_type("Represents the configuration to expect an HTTP request on a new connection and how to handle it.");
+        fields.document(format!("Maximum size of header in bytes; must be between 1 and {}", crate::http::MAX_HEADER_SIZE).as_str());
         fields.add_method_mut("set_max_header_size", |_, this, size: usize| {
             if size == 0 || size > crate::http::MAX_HEADER_SIZE {
                 return Err(LuaError::RuntimeError(format!(
@@ -86,6 +88,7 @@ impl tealr::mlu::TealData for ExpectHttp {
             this.max_header_size = size;
             Ok(())
         });
+        fields.document(format!("Maximum number of header allowed in a request; must be between 1 and {}", crate::http::MAX_HEADERS).as_str());
         fields.add_method_mut("set_max_header_count", |_, this, count: usize| {
             if count == 0 || count > crate::http::MAX_HEADERS {
                 return Err(LuaError::RuntimeError(format!(
@@ -96,6 +99,7 @@ impl tealr::mlu::TealData for ExpectHttp {
             this.max_header_count = count;
             Ok(())
         });
+        fields.document("Maximum time in seconds before we expect headers from the request after a connection is established");
         fields.add_method_mut("set_header_timeout", |_, this, timeout: u64| {
             if timeout == 0 {
                 return Err(LuaError::RuntimeError(
@@ -105,6 +109,7 @@ impl tealr::mlu::TealData for ExpectHttp {
             this.header_timeout = timeout;
             Ok(())
         });
+        fields.document("Not implemented");
         fields.add_method_mut("set_tls", |_, this, tls_keyfile: String| {
             if tls_keyfile.is_empty() {
                 return Err(LuaError::RuntimeError(
@@ -126,9 +131,11 @@ pub struct Deny {
 }
 
 impl TealData for Deny {
-    fn add_fields<F: tealr::mlu::TealDataFields<Self>>(fields: &mut F) {
-        fields.add_field_method_get("reason", |lua, this| {
-            lua.create_string(this.reason.to_string())
+    fn add_methods<F: tealr::mlu::TealDataMethods<Self>>(methods: &mut F) {
+        methods.document_type("Connection will be dropped silently; Use `CustomHttpResponse` if you want to send a response to the client before dropping the connection.");
+        methods.add_method_mut("set_reason", |_, this, reason: String| {
+            this.reason = reason.into();
+            Ok(())
         });
     }
 }
@@ -153,6 +160,7 @@ impl tealr::mlu::TealData for CustomHttpResponse {
     }
 
     fn add_methods<M: TealDataMethods<Self>>(methods: &mut M) {
+        methods.document_type("Send a custom HTTP response to a client");
         methods.add_method_mut("set_status", |_, this, status: u16| {
             if !(200..=599).contains(&status) {
                 return Err(LuaError::RuntimeError(
@@ -266,6 +274,7 @@ impl_from_lua_exact_userdata!(ForwardHttp);
 
 impl tealr::mlu::TealData for ForwardHttp {
     fn add_methods<F: TealDataMethods<Self>>(methods: &mut F) {
+        methods.document_type("Forward the request to an upstream HTTP server");
         methods.add_method_mut("set_max_request_body_size", |_, this, size: usize| {
             if size == 0 {
                 return Err(LuaError::RuntimeError(
@@ -304,6 +313,7 @@ impl tealr::mlu::TealData for ForwardHttp {
             this.max_response_header_count = count;
             Ok(())
         });
+        methods.document("Sets the timeout in seconds for establishing a connection to the upstream server");
         methods.add_method_mut("set_connect_timeout", |_, this, timeout: Option<u32>| {
             if timeout == Some(0) {
                 return Err(LuaError::RuntimeError(
@@ -322,6 +332,7 @@ impl tealr::mlu::TealData for ForwardHttp {
             this.proxy_read_timeout = timeout;
             Ok(())
         });
+        methods.document("Sets the timeout in seconds for reading the request body from the client");
         methods.add_method_mut(
             "set_client_body_timeout",
             |_, this, timeout: Option<u32>| {
@@ -334,6 +345,7 @@ impl tealr::mlu::TealData for ForwardHttp {
                 Ok(())
             },
         );
+        methods.document("Set the cache configuration for the response. `ttl` is the time to live in seconds, and `key` is the cache key. **Not implemented yet**");
         methods.add_method_mut("set_cache", |_, this, (ttl, key): (u32, String)| {
             this.cache = Some(RespCacheBlock {
                 enabled: true,
@@ -342,6 +354,7 @@ impl tealr::mlu::TealData for ForwardHttp {
             });
             Ok(())
         });
+        methods.document("insert a header into a request before forwarding it to upstream");
         methods.add_method_mut("add_header", |_, this, (key, val): (String, String)| {
             if !valid_patch_header_name(&key) || !valid_header_value(&val) {
                 return Err(LuaError::RuntimeError(
@@ -361,6 +374,7 @@ impl tealr::mlu::TealData for ForwardHttp {
             }
             Ok(())
         });
+        methods.document("removes a header from the request before forwarding it to upstream");
         methods.add_method_mut("remove_header", |_, this, key: String| {
             if !valid_patch_header_name(&key) {
                 return Err(LuaError::RuntimeError(
