@@ -107,6 +107,7 @@ Lua functions can live in other files and be loaded with `require`. Use
 `proxy:cached_call` to cache a function's result by host and key for a number
 of seconds:
 ```lua
+-- iploc is the module in the current directory that translated ip to country code
 local iploc = require("iploc")
 
 proxy:on_request("example.com", function(client, req)
